@@ -1,0 +1,13 @@
+{
+  "metrics": [
+    {
+      "name": "unique_customers",
+      "domain": "customers",
+      "description": "Count distinct non-null order.customer_id among qualifying orders in the requested periods.",
+      "grain": "customer",
+      "base_table": "order",
+      "aggregation": "COUNT(DISTINCT order.customer_id)",
+      "time_column": "order.created_at"
+    }
+  ]
+}

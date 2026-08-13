@@ -1,0 +1,393 @@
+{
+  "tables": [
+    {
+      "name": "order",
+      "description": "Canonical order entity. created_at is the placed-order event timestamp. canceled_at is not canonical cancellation truth and delivery_status is not canonical actual-delivery truth.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "customer_id",
+          "type": "text",
+          "nullable": true,
+          "references": "customer.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "canceled_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "zoho_order_status",
+          "type": "enum",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "status",
+          "type": "enum",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "fulfillment_status",
+          "type": "enum",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "payment_status",
+          "type": "enum",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "delivery_status",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "store_id",
+          "type": "text",
+          "nullable": true,
+          "references": "store.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "is_b2b",
+          "type": "boolean",
+          "nullable": true,
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "line_item",
+      "description": "Historical purchased line. variant_id is analytical variant identity, title is historical display metadata, quantity is original ordered quantity, and monetary integers use minor currency units.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "references": "order.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "variant_id",
+          "type": "text",
+          "nullable": true,
+          "references": "product_variant.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "unit_price",
+          "type": "integer",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "quantity",
+          "type": "integer",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "is_return",
+          "type": "boolean",
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "product_variant",
+      "description": "Current sellable variant entity. id is the analytical variant key when joined to historical line_item.variant_id. sku is only the literal stored SKU string.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "product_id",
+          "type": "text",
+          "references": "product.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "sku",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "internal"
+        }
+      ]
+    },
+    {
+      "name": "product",
+      "description": "Current product-level entity used to roll variants to product grain. Current catalog metadata is enrichment for historical transactions.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "customer",
+      "description": "Customer identity and order-history owner. id is the canonical analytical identity. PII fields are restricted by pii-policy.json.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "first_name",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "pii"
+        },
+        {
+          "name": "phone",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "pii"
+        }
+      ]
+    },
+    {
+      "name": "fulfillment",
+      "description": "Packing, shipping and actual custom delivery lifecycle. Multiple fulfillment rows may exist for one order.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "references": "order.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "packed_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "shipped_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "delivery_status",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "payment",
+      "description": "Payment lifecycle. Multiple payment rows may exist for one order; select the applicable payment at order grain before monetary aggregation. Raw provider data is denied.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "nullable": true,
+          "references": "order.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "amount",
+          "type": "integer",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "currency_code",
+          "type": "text",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "canceled_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "sensitivity": "safe"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "refund_request",
+      "description": "Verified operational refund workflow. Processed refund amount comes from refund_amount for processed requests.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "references": "order.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "partial_cancellation_id",
+          "type": "text",
+          "nullable": true,
+          "references": "partial_order_cancellation.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "refund_amount",
+          "type": "integer",
+          "sensitivity": "safe"
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "partial_order_cancellation",
+      "description": "Partial order cancellation header. Partial cancellation does not imply full order cancellation.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "references": "order.id",
+          "sensitivity": "internal"
+        }
+      ]
+    },
+    {
+      "name": "partial_order_cancellation_item",
+      "description": "Partial cancellation line quantities. Preaggregate cancelled_quantity by line_item_id before joining historical lines.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "partial_cancellation_id",
+          "type": "text",
+          "references": "partial_order_cancellation.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "line_item_id",
+          "type": "text",
+          "references": "line_item.id",
+          "sensitivity": "internal"
+        },
+        {
+          "name": "cancelled_quantity",
+          "type": "integer",
+          "sensitivity": "safe"
+        }
+      ]
+    },
+    {
+      "name": "order_lifecycle_log",
+      "description": "Order lifecycle transition history.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "order_id",
+          "type": "text",
+          "references": "order.id",
+          "sensitivity": "internal"
+        }
+      ]
+    },
+    {
+      "name": "store",
+      "description": "Store/location entity.",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "primary_key": true,
+          "sensitivity": "internal"
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "sensitivity": "safe"
+        }
+      ]
+    }
+  ]
+}

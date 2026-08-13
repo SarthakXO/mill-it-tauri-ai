@@ -1,0 +1,118 @@
+{
+  "business_timezone": "Asia/Kolkata",
+  "range_semantics": "start inclusive, end_exclusive exclusive",
+  "terms": [
+    {
+      "term": "order",
+      "meaning": "Canonical order entity is the reserved PostgreSQL table order. The canonical analytical grain is order.id."
+    },
+    {
+      "term": "placed order",
+      "synonyms": [
+        "order placed",
+        "orders placed",
+        "order count",
+        "order volume",
+        "total orders"
+      ],
+      "meaning": "A physical order row whose order.created_at falls inside the requested IST interval. Plain placed-order metrics do not exclude later-cancelled orders."
+    },
+    {
+      "term": "qualifying order",
+      "synonyms": [
+        "qualifying orders",
+        "non-cancelled order",
+        "non-canceled order"
+      ],
+      "meaning": "A placed order that is not fully cancelled. Full cancellation means native order.status is canceled/cancelled OR non-null order.zoho_order_status is CANCELED/CANCELLED. order.canceled_at is not canonical cancellation truth."
+    },
+    {
+      "term": "SKU",
+      "synonyms": ["variant", "item", "sellable item"],
+      "meaning": "Normally the canonical analytical variant grain line_item.variant_id / product_variant.id. product_variant.sku is only the literal stored SKU string when explicitly requested."
+    },
+    {
+      "term": "product",
+      "meaning": "Product-level analytical grain is product.id / product_variant.product_id. Product requests roll applicable variants to product grain."
+    },
+    {
+      "term": "variant",
+      "meaning": "Variant-level analytical grain is line_item.variant_id / product_variant.id. Display titles do not define analytical identity."
+    },
+    {
+      "term": "operational status",
+      "meaning": "order.zoho_order_status. It is distinct from order.status, order.fulfillment_status, order.payment_status and fulfillment.delivery_status."
+    },
+    {
+      "term": "fulfilled order",
+      "synonyms": ["operationally fulfilled"],
+      "meaning": "By default in Mill-it Ops, operationally fulfilled means order.zoho_order_status is FULFILLED. Native fulfillment status is separate and must be explicitly requested."
+    },
+    {
+      "term": "actual delivery status",
+      "synonyms": ["delivery status"],
+      "meaning": "Canonical actual custom delivery state is fulfillment.delivery_status. order.delivery_status is not authoritative actual-delivery truth."
+    },
+    {
+      "term": "customer",
+      "meaning": "customer.id / order.customer_id is the canonical analytical customer identifier. Customer behavior is based on qualifying purchases unless another population is explicitly requested."
+    },
+    {
+      "term": "net units sold",
+      "synonyms": ["net quantity sold", "best-selling by units"],
+      "meaning": "Sum of line_item.quantity minus preaggregated partial cancelled quantity, floored at zero, among qualifying orders. Product or variant grain is determined separately by the request."
+    },
+    {
+      "term": "placed order value",
+      "meaning": "Historical placed-order monetary value based on the selected applicable order-level payment when supported. It is distinct from qualifying, captured and net-collected value."
+    },
+    {
+      "term": "qualifying order value",
+      "meaning": "Placed order value for a qualifying order reduced by applicable partial-cancellation value. It is an operational metric, not accounting revenue."
+    },
+    {
+      "term": "qualifying AOV",
+      "meaning": "Sum of qualifying order value divided by count of qualifying orders over the same population."
+    },
+    {
+      "term": "captured value",
+      "meaning": "Selected applicable order-level payment amount for orders whose canonical order.payment_status is captured."
+    },
+    {
+      "term": "processed refund",
+      "meaning": "refund_request.refund_amount where the verified refund request status is processed. payment.amount_refunded and native refund rows are not the current canonical processed-refund source."
+    },
+    {
+      "term": "net collected value",
+      "synonyms": ["net realized operational value"],
+      "meaning": "Operational approximation equal to captured value minus processed refunds. It is not accounting-recognized revenue."
+    },
+    {
+      "term": "AOV",
+      "synonyms": ["average order value"],
+      "meaning": "AOV is not a single universal metric. Use placed AOV, qualifying AOV or realized AOV according to the requested population/value definition. Generic sales-oriented AOV should use the explicitly supported qualifying AOV definition."
+    },
+    {
+      "term": "customer cohort",
+      "meaning": "A customer population selected by validated qualifying-order frequency, recency or inactivity conditions. Eligibility-window counting and latest qualifying activity may require separate calculations."
+    },
+    {
+      "term": "last 6 months",
+      "synonyms": ["past 6 months"],
+      "meaning": "Rolling six-calendar-month lookback from the validated historical as-of boundary unless the request explicitly asks for complete calendar months."
+    },
+    {
+      "term": "last 6 complete months",
+      "meaning": "Six fully completed calendar months. Rust resolves the exact IST boundaries."
+    },
+    {
+      "term": "forecast",
+      "synonyms": ["projection", "expected orders", "predict"],
+      "meaning": "Rust-generated predictive output using complete historical observations. Qwen supplies semantic intent and historical-query requirements but does not invent forecast values."
+    },
+    {
+      "term": "MoM / WoW / YoY",
+      "meaning": "Month-over-month means sequential calendar-month comparison, week-over-week means sequential calendar-week comparison, and year-over-year means matching comparable spans one year apart."
+    }
+  ]
+}

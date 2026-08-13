@@ -1,0 +1,27 @@
+{
+  "domain": "customers",
+  "concepts": [
+    "unique customer",
+    "repeat customer",
+    "lapsed customer",
+    "inactive customer",
+    "customer recency",
+    "customer order frequency",
+    "customer cohort",
+    "customer-product reorder history"
+  ],
+  "semantics": [
+    "customer.id / order.customer_id is the canonical analytical customer identity.",
+    "Customer purchase behavior is based on qualifying orders unless another population is explicitly requested.",
+    "Fully cancelled orders do not increase qualifying purchase count and do not reset customer recency.",
+    "Unique customer means a distinct non-null order.customer_id among the requested qualifying purchase population.",
+    "Repeat customer means a customer with at least two qualifying purchases in the relevant population/window.",
+    "For eligibility-plus-inactivity cohorts, calculate eligibility order count and latest qualifying order separately.",
+    "Do not restrict latest qualifying-order calculation to an eligibility-window lower bound when a more recent qualifying purchase could exist.",
+    "last N months / past N months means a rolling calendar-month lookback unless complete calendar months are explicitly requested.",
+    "Use opaque customer_id for model-facing aggregate calculations.",
+    "Customer PII is excluded from aggregate model context and may appear only in explicitly authorized local customer-record results.",
+    "PII-containing customer rows must bypass the Insight Analyst.",
+    "Reorder prediction uses customer_id + variant_id qualifying purchase history and is calculated deterministically by Rust."
+  ]
+}

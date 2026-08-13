@@ -1,0 +1,29 @@
+{
+  "domain": "products",
+  "concepts": [
+    "product",
+    "product variant",
+    "SKU",
+    "historical sold item",
+    "raw ordered quantity",
+    "net units sold",
+    "top-selling product",
+    "top-selling variant",
+    "product performance",
+    "variant performance"
+  ],
+  "semantics": [
+    "line_item.variant_id is the canonical historical variant/SKU-level analytical identity.",
+    "Variant requests aggregate by line_item.variant_id.",
+    "Product requests roll variants through product_variant.product_id and aggregate by product_id.",
+    "Product and variant are different analytical grains and must not be silently substituted.",
+    "line_item.title is historical display metadata and must not be part of the analytical grouping key for variant metrics.",
+    "product.title and product_variant.title are display metadata and do not define analytical identity.",
+    "product_variant.sku is only the literal stored SKU string when explicitly requested; it is not the normal analytical variant key.",
+    "Net units sold equals original line_item.quantity minus preaggregated partial cancelled quantity, floored at zero, among qualifying orders.",
+    "Fully cancelled orders contribute no qualifying product demand.",
+    "Current product and product_variant tables are optional enrichment for historical transaction facts and must not unnecessarily remove historical line items.",
+    "Display labels should be selected separately from the metric grouping grain.",
+    "Do not allow payment, fulfillment or other one-to-many child joins to multiply line quantities."
+  ]
+}

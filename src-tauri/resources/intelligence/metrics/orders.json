@@ -1,0 +1,29 @@
+{
+  "metrics": [
+    {
+      "name": "order_count",
+      "domain": "operations",
+      "description": "Count physical orders in the requested IST periods. Plain order_count uses placed-order population and does not exclude later-cancelled orders unless an explicit qualifying/non-cancelled filter is requested.",
+      "grain": "order",
+      "base_table": "order",
+      "aggregation": "COUNT(*)",
+      "time_column": "order.created_at"
+    },
+    {
+      "name": "cancelled_order_count",
+      "domain": "operations",
+      "description": "Count orders whose native order.status is canceled/cancelled OR whose non-null order.zoho_order_status is CANCELED/CANCELLED.",
+      "grain": "order",
+      "base_table": "order",
+      "time_column": "order.created_at"
+    },
+    {
+      "name": "cancellation_rate",
+      "domain": "operations",
+      "description": "Cancelled order count divided by all placed orders in the same requested bucket, expressed as a percentage.",
+      "grain": "order",
+      "base_table": "order",
+      "time_column": "order.created_at"
+    }
+  ]
+}

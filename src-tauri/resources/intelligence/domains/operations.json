@@ -1,0 +1,35 @@
+{
+  "domain": "operations",
+  "concepts": [
+    "orders",
+    "placed orders",
+    "qualifying orders",
+    "order count",
+    "order volume",
+    "operational status",
+    "native order status",
+    "payment status",
+    "native fulfillment status",
+    "cancellations",
+    "fulfilled orders",
+    "daily weekly and monthly order volume",
+    "store-level order volume",
+    "B2B orders"
+  ],
+  "semantics": [
+    "Business dates use Asia/Kolkata and half-open ranges: start inclusive and end_exclusive exclusive.",
+    "Plain orders, orders placed, order count and order volume mean placed-order population unless the request explicitly asks for qualifying or non-cancelled orders.",
+    "Placed-order population does not automatically exclude orders that were later cancelled.",
+    "Qualifying-order population excludes orders whose native status is canceled/cancelled OR whose non-null Zoho operational status is CANCELED/CANCELLED.",
+    "order.canceled_at is not canonical full-cancellation truth.",
+    "Operational status means order.zoho_order_status.",
+    "By default, fulfilled orders means operationally fulfilled: order.zoho_order_status = FULFILLED.",
+    "order.status, order.fulfillment_status, order.payment_status, order.zoho_order_status and fulfillment.delivery_status are distinct concepts.",
+    "Do not use order.delivery_status as actual delivery truth.",
+    "Counting orders after one-to-many joins requires preserving order.id grain.",
+    "Store-level historical order attribution uses order.store_id.",
+    "Explicit historical B2B segmentation uses order.is_b2b when that physical field is available.",
+    "Monetary definitions such as AOV, captured value, refunds and net collected value belong to the money domain rather than operations.",
+    "Predictive numerical output belongs to deterministic Rust forecasting rather than generated SQL."
+  ]
+}

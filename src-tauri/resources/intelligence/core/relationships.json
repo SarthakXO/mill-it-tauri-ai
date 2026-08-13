@@ -1,0 +1,71 @@
+{
+  "relationships": [
+    {
+      "from": "line_item.order_id",
+      "to": "order.id",
+      "cardinality": "many-to-one",
+      "warning": "An order has multiple line items. Preserve the intended order, product or variant grain before aggregation."
+    },
+    {
+      "from": "order.customer_id",
+      "to": "customer.id",
+      "cardinality": "many-to-one"
+    },
+    {
+      "from": "line_item.variant_id",
+      "to": "product_variant.id",
+      "cardinality": "many-to-one",
+      "warning": "Current variant data is enrichment for historical line items. Do not use a display title as analytical identity."
+    },
+    {
+      "from": "product_variant.product_id",
+      "to": "product.id",
+      "cardinality": "many-to-one",
+      "warning": "Use product_id for product grain and variant_id for variant grain."
+    },
+    {
+      "from": "fulfillment.order_id",
+      "to": "order.id",
+      "cardinality": "many-to-one",
+      "warning": "Potentially multiple fulfillments per order can multiply rows. Preaggregate fulfillment data before order-level analytics."
+    },
+    {
+      "from": "payment.order_id",
+      "to": "order.id",
+      "cardinality": "many-to-one",
+      "warning": "Potentially multiple payments per order can multiply monetary values. Select one applicable payment per order before aggregation."
+    },
+    {
+      "from": "refund_request.order_id",
+      "to": "order.id",
+      "cardinality": "many-to-one",
+      "warning": "Preaggregate processed refunds to order grain before combining with payments or other child tables."
+    },
+    {
+      "from": "refund_request.partial_cancellation_id",
+      "to": "partial_order_cancellation.id",
+      "cardinality": "many-to-one"
+    },
+    {
+      "from": "partial_order_cancellation.order_id",
+      "to": "order.id",
+      "cardinality": "many-to-one"
+    },
+    {
+      "from": "partial_order_cancellation_item.line_item_id",
+      "to": "line_item.id",
+      "cardinality": "many-to-one",
+      "warning": "Preaggregate cancelled_quantity by line_item_id before joining line_item."
+    },
+    {
+      "from": "partial_order_cancellation_item.partial_cancellation_id",
+      "to": "partial_order_cancellation.id",
+      "cardinality": "many-to-one"
+    },
+    {
+      "from": "order.store_id",
+      "to": "store.id",
+      "cardinality": "many-to-one"
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "classes": {
+    "safe": [
+      "aggregate counts",
+      "dates",
+      "status categories",
+      "product and variant display titles"
+    ],
+    "internal": [
+      "customer_id",
+      "order_id",
+      "line_item_id",
+      "variant_id",
+      "product_id",
+      "store_id",
+      "fulfillment_id",
+      "payment_id"
+    ],
+    "pii": [
+      "email",
+      "phone",
+      "first_name",
+      "last_name",
+      "date_of_birth",
+      "address",
+      "latitude",
+      "longitude"
+    ],
+    "secret": [
+      "password_hash",
+      "otp",
+      "token",
+      "secret",
+      "raw payment credentials"
+    ],
+    "denied": ["passwords", "OTPs", "payment tokens", "raw gateway credentials"]
+  },
+  "rules": [
+    "Internal analytical identifiers may be used by the SQL planner when required for grouping, joins or deterministic processing.",
+    "PII schema fields are excluded from normal aggregate model context.",
+    "first_name and phone may be projected only for an explicit authorized local customer-record request.",
+    "PII-containing customer result rows must not be sent to the Insight Analyst or any subsequent model analysis step.",
+    "Aggregate or count-only customer requests must not retrieve first_name, phone or other PII.",
+    "Secret and denied fields are never projected, logged or sent to the model.",
+    "Customer identity for analytics is customer.id / order.customer_id, never phone, email or name."
+  ]
+}

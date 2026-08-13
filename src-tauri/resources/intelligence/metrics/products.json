@@ -1,0 +1,20 @@
+{
+  "metrics": [
+    {
+      "name": "quantity_sold",
+      "domain": "products",
+      "description": "Net historical line quantity after preaggregated partial cancellation, excluding fully cancelled orders. Analytical grain is determined by the requested dimension: variant uses line_item.variant_id; product uses product_variant.product_id. Display labels never define aggregation grain.",
+      "base_table": "order + line_item + preaggregated partial_order_cancellation_item",
+      "aggregation": "SUM(GREATEST(line_item.quantity - COALESCE(partial_cancelled_qty, 0), 0))",
+      "time_column": "order.created_at"
+    },
+    {
+      "name": "unique_variants",
+      "domain": "products",
+      "description": "Count distinct non-null line_item.variant_id among qualifying orders in the requested period.",
+      "base_table": "order + line_item",
+      "aggregation": "COUNT(DISTINCT line_item.variant_id)",
+      "time_column": "order.created_at"
+    }
+  ]
+}
