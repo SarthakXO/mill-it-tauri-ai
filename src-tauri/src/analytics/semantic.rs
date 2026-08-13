@@ -1,13 +1,14 @@
 use super::{
     compiler::{compile, CompiledAnalyticsQuery},
-    insights::summarize_metric_query,
+    facts::{build_time_series_facts, AnalyticalFacts},
+    insights::summarize_metric_query_with_facts,
     plan::{AnalyticsPlan, Dimension, Metric, VisualizationIntent},
 };
 use crate::{
     agent::{AgentError, AgentResponse, ChartType, WarningBlock},
     database::{validate_sql, Database, QueryParameter, QueryResult},
 };
-use chrono::{Datelike, Duration, Weekday};
+use chrono::{Datelike, Weekday};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -66,10 +67,31 @@ pub(crate) async fn execute_semantic_plan(
         .execute_deterministic(&validated, &compiled.parameters)
         .await?;
     let calculation_started = Instant::now();
+
     apply_period_labels(&mut result, &compiled);
+
+    let (partial_start_bucket, partial_end_bucket) = partial_bucket_edges(plan);
+
+    let analytical_facts =
+        build_time_series_facts(plan, &result, partial_start_bucket, partial_end_bucket);
+
     let calculation_duration_ms = calculation_started.elapsed().as_millis();
+
+    #[cfg(debug_assertions)]
+    if let Some(facts) = analytical_facts.as_ref() {
+        eprintln!(
+        "[analytics facts]\nrequest_id={}\npartial_start_bucket={}\npartial_end_bucket={}\ncomplete_bucket_count={}",
+        request_id,
+        facts.partial_start_bucket,
+        facts.partial_end_bucket,
+        facts.complete_bucket_count
+    );
+    }
+
     let summary_started = Instant::now();
-    let answer = summarize(plan, &result);
+
+    let answer = summarize_metric_query_with_facts(plan, &result, analytical_facts.as_ref());
+
     let summary_duration_ms = summary_started.elapsed().as_millis();
     let chart_type = chart_type(plan);
     let mut response = AgentResponse::from_query(
@@ -81,10 +103,8 @@ pub(crate) async fn execute_semantic_plan(
         chart_type,
         Some(chart_title(plan).to_owned()),
     );
-    if partial_week_edges(plan) {
-        response.warnings.push(WarningBlock {
-            message: "The first and last calendar-week buckets are partial because the selected range starts or ends mid-week.".to_owned(),
-        });
+    if let Some(message) = partial_bucket_warning(plan, partial_start_bucket, partial_end_bucket) {
+        response.warnings.push(WarningBlock { message });
     }
     #[cfg(debug_assertions)]
     eprintln!(
@@ -120,17 +140,63 @@ fn apply_period_labels(result: &mut QueryResult, compiled: &CompiledAnalyticsQue
     result.columns.insert(0, "period".to_owned());
 }
 
-fn summarize(plan: &AnalyticsPlan, result: &QueryResult) -> String {
-    summarize_metric_query(plan, result)
+fn partial_bucket_edges(plan: &AnalyticsPlan) -> (bool, bool) {
+    if plan.periods.len() != 1 {
+        return (false, false);
+    }
+
+    let period = &plan.periods[0];
+
+    if plan.dimensions.contains(&Dimension::Week) {
+        return (
+            period.start.weekday() != Weekday::Mon,
+            period.end_exclusive.weekday() != Weekday::Mon,
+        );
+    }
+
+    if plan.dimensions.contains(&Dimension::Month) {
+        return (period.start.day() != 1, period.end_exclusive.day() != 1);
+    }
+
+    // Day-grain historical periods already use whole-day
+    // start-inclusive/end-exclusive boundaries.
+    (false, false)
 }
 
-fn partial_week_edges(plan: &AnalyticsPlan) -> bool {
-    if !plan.dimensions.contains(&Dimension::Week) || plan.periods.len() != 1 {
-        return false;
+fn partial_bucket_warning(
+    plan: &AnalyticsPlan,
+    partial_start_bucket: bool,
+    partial_end_bucket: bool,
+) -> Option<String> {
+    if !partial_start_bucket && !partial_end_bucket {
+        return None;
     }
-    let period = &plan.periods[0];
-    period.start.weekday() != Weekday::Mon
-        || (period.end_exclusive - Duration::days(1)).weekday() != Weekday::Sun
+
+    let (bucket, boundary) = if plan.dimensions.contains(&Dimension::Week) {
+        ("calendar-week", "week")
+    } else if plan.dimensions.contains(&Dimension::Month) {
+        ("calendar-month", "month")
+    } else {
+        return None;
+    };
+
+    let message = match (
+        partial_start_bucket,
+        partial_end_bucket,
+    ) {
+        (true, true) => format!(
+            "The first and last {bucket} buckets are partial because the selected range starts or ends mid-{boundary}."
+        ),
+        (true, false) => format!(
+            "The first {bucket} bucket is partial because the selected range starts mid-{boundary}."
+        ),
+        (false, true) => format!(
+            "The last {bucket} bucket is partial because the selected range ends mid-{boundary}."
+        ),
+        (false, false) => unreachable!(),
+    };
+
+    Some(message)
 }
 
 fn chart_type(plan: &AnalyticsPlan) -> Option<ChartType> {
@@ -247,6 +313,25 @@ mod tests {
             limit: None,
             visualization: Some(VisualizationIntent::Line),
         };
-        assert!(partial_week_edges(&plan));
+        assert_eq!(partial_bucket_edges(&plan), (true, true));
+    }
+    #[test]
+    fn monthly_partial_edges_are_detected() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Operations,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![Dimension::Month],
+            periods: vec![TimePeriod {
+                label: "Rolling three months".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 5, 13).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        assert_eq!(partial_bucket_edges(&plan), (true, true));
     }
 }

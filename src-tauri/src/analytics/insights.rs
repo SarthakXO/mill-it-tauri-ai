@@ -1,4 +1,7 @@
-use super::plan::{AnalyticsPlan, Dimension, Metric};
+use super::{
+    facts::{AnalyticalFacts, MetricFacts},
+    plan::{AnalyticsPlan, Dimension, Metric},
+};
 use crate::database::QueryResult;
 use chrono::{Datelike, Duration};
 use serde_json::Value;
@@ -19,6 +22,247 @@ pub(crate) fn summarize_metric_query(plan: &AnalyticsPlan, result: &QueryResult)
         return multi_metric_summary(plan, result);
     }
     comparison_summary(plan, result, plan.metrics[0])
+}
+
+pub(crate) fn summarize_metric_query_with_facts(
+    plan: &AnalyticsPlan,
+    result: &QueryResult,
+    analytical_facts: Option<&AnalyticalFacts>,
+) -> String {
+    let is_time_series = plan.dimensions.iter().any(|dimension| {
+        matches!(
+            dimension,
+            Dimension::Day | Dimension::Week | Dimension::Month
+        )
+    });
+
+    if !is_time_series {
+        return summarize_metric_query(plan, result);
+    }
+
+    let Some(facts) = analytical_facts else {
+        return summarize_metric_query(plan, result);
+    };
+
+    if facts.complete_bucket_count == 0 {
+        return format!(
+            "The returned series contains no complete buckets suitable for analytical comparison.{}",
+            partial_bucket_note(facts)
+        );
+    }
+
+    if plan.metrics.len() > 1 {
+        return multi_metric_fact_summary(plan, facts);
+    }
+
+    let Some(metric) = plan.metrics.first().copied() else {
+        return summarize_metric_query(plan, result);
+    };
+
+    let Some(metric_facts) = facts
+        .metrics
+        .iter()
+        .find(|facts| facts.metric == metric.value_key())
+    else {
+        return summarize_metric_query(plan, result);
+    };
+
+    single_metric_fact_summary(metric, metric_facts, facts)
+}
+
+fn single_metric_fact_summary(
+    metric: Metric,
+    metric_facts: &MetricFacts,
+    facts: &AnalyticalFacts,
+) -> String {
+    let note = partial_bucket_note(facts);
+
+    let Some(first) = metric_facts.first_complete.as_ref() else {
+        return format!(
+            "No complete {} buckets were available for analysis.{}",
+            facts.complete_bucket_count, note
+        );
+    };
+
+    let Some(last) = metric_facts.last_complete.as_ref() else {
+        return format!(
+            "{} was {} for the only complete bucket, {}.{}",
+            metric_label(metric),
+            format_value(metric, first.value),
+            first.label,
+            note
+        );
+    };
+
+    if facts.complete_bucket_count == 1 {
+        return format!(
+            "{} was {} for the only complete bucket, {}.{}",
+            metric_label(metric),
+            format_value(metric, first.value),
+            first.label,
+            note
+        );
+    }
+
+    let overall = metric_facts
+        .overall_change
+        .as_ref()
+        .map(|change| {
+            change.percent_change.map_or_else(
+                || {
+                    if change.to.value == change.from.value {
+                        "had no meaningful percentage change".to_owned()
+                    } else {
+                        "changed from a zero baseline; percentage change is not meaningful"
+                            .to_owned()
+                    }
+                },
+                |percent| format!("changed {percent:+.1}%"),
+            )
+        })
+        .unwrap_or_else(|| "had no comparable overall change".to_owned());
+
+    let peak = metric_facts
+        .peak_complete
+        .as_ref()
+        .map(|point| {
+            format!(
+                "{} was highest at {}",
+                point.label,
+                format_value(metric, point.value)
+            )
+        })
+        .unwrap_or_else(|| "No complete-bucket maximum was available".to_owned());
+
+    let lowest = metric_facts
+        .lowest_complete
+        .as_ref()
+        .map(|point| {
+            format!(
+                "{} was lowest at {}",
+                point.label,
+                format_value(metric, point.value)
+            )
+        })
+        .unwrap_or_else(|| "no complete-bucket minimum was available".to_owned());
+
+    let increase = metric_facts
+        .largest_increase
+        .as_ref()
+        .map(|change| {
+            format!(
+                "Largest increase: {} to {} ({:+.0}).",
+                change.from.label, change.to.label, change.absolute_change
+            )
+        })
+        .unwrap_or_else(|| "There was no increase across complete buckets.".to_owned());
+
+    let decline = metric_facts
+        .largest_decline
+        .as_ref()
+        .map(|change| {
+            format!(
+                "Largest decline: {} to {} ({:+.0}).",
+                change.from.label, change.to.label, change.absolute_change
+            )
+        })
+        .unwrap_or_else(|| "There was no decline across complete buckets.".to_owned());
+
+    format!(
+        "Across {} complete buckets, {} to {} {}. {}, while {}.\n\n{} {}{}",
+        facts.complete_bucket_count,
+        first.label,
+        last.label,
+        overall,
+        peak,
+        lowest,
+        increase,
+        decline,
+        note
+    )
+}
+
+fn multi_metric_fact_summary(plan: &AnalyticsPlan, facts: &AnalyticalFacts) -> String {
+    let mut summaries = Vec::new();
+    let mut first_label = None::<String>;
+    let mut last_label = None::<String>;
+
+    for metric in &plan.metrics {
+        let Some(metric_facts) = facts
+            .metrics
+            .iter()
+            .find(|facts| facts.metric == metric.value_key())
+        else {
+            continue;
+        };
+
+        let (Some(first), Some(last)) = (
+            metric_facts.first_complete.as_ref(),
+            metric_facts.last_complete.as_ref(),
+        ) else {
+            continue;
+        };
+
+        first_label.get_or_insert_with(|| first.label.clone());
+
+        last_label.get_or_insert_with(|| last.label.clone());
+
+        let change = metric_facts
+            .overall_change
+            .as_ref()
+            .and_then(|change| change.percent_change)
+            .map_or_else(
+                || {
+                    if first.value == last.value {
+                        format!("{} had no percentage change", metric_label(*metric))
+                    } else {
+                        format!(
+                            "{} changed from a zero baseline; percentage change is not meaningful",
+                            metric_label(*metric)
+                        )
+                    }
+                },
+                |percent| format!("{} changed {percent:+.1}%", metric_label(*metric)),
+            );
+
+        summaries.push(change);
+    }
+
+    if summaries.is_empty() {
+        return format!(
+            "No complete metric series were available for analytical comparison.{}",
+            partial_bucket_note(facts)
+        );
+    }
+
+    let first_label = first_label.unwrap_or_else(|| "first complete bucket".to_owned());
+
+    let last_label = last_label.unwrap_or_else(|| "last complete bucket".to_owned());
+
+    format!(
+        "Across {} complete buckets from {} through {}, {}. These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV.{}",
+        facts.complete_bucket_count,
+        first_label,
+        last_label,
+        summaries.join(", while "),
+        partial_bucket_note(facts)
+    )
+}
+
+fn partial_bucket_note(facts: &AnalyticalFacts) -> String {
+    match (facts.partial_start_bucket, facts.partial_end_bucket) {
+        (true, true) => {
+            " The first and last buckets are partial and are excluded from analytical comparisons."
+                .to_owned()
+        }
+        (true, false) => {
+            " The first bucket is partial and is excluded from analytical comparisons.".to_owned()
+        }
+        (false, true) => {
+            " The last bucket is partial and is excluded from analytical comparisons.".to_owned()
+        }
+        (false, false) => String::new(),
+    }
 }
 
 fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric) -> String {
@@ -562,5 +806,78 @@ mod tests {
 
         assert!(summary.contains("Sharbati Wheat Atta 5kg"));
         assert!(!summary.contains("Unnamed item"));
+    }
+
+    #[test]
+    fn weekly_summary_uses_complete_bucket_facts() {
+        use crate::analytics::facts::build_time_series_facts;
+        use crate::analytics::plan::{
+            AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod, VisualizationIntent,
+        };
+        use chrono::NaiveDate;
+        use serde_json::{Map, Value};
+
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Operations,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![Dimension::Week],
+            periods: vec![TimePeriod {
+                label: "May through July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        let rows = [
+            ("2026-04-27", 120),
+            ("2026-05-04", 258),
+            ("2026-05-11", 259),
+            ("2026-05-18", 254),
+            ("2026-05-25", 235),
+            ("2026-06-01", 237),
+            ("2026-06-08", 234),
+            ("2026-06-15", 273),
+            ("2026-06-22", 331),
+            ("2026-06-29", 338),
+            ("2026-07-06", 363),
+            ("2026-07-13", 375),
+            ("2026-07-20", 382),
+            ("2026-07-27", 291),
+        ]
+        .map(|(week, count)| {
+            let mut row = Map::new();
+            row.insert("week".to_owned(), Value::String(week.to_owned()));
+            row.insert("order_count".to_owned(), Value::from(count));
+            row
+        })
+        .to_vec();
+
+        let result = QueryResult {
+            columns: vec!["week".to_owned(), "order_count".to_owned()],
+            row_count: rows.len(),
+            rows,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let facts = build_time_series_facts(&plan, &result, true, true).unwrap();
+
+        let summary = summarize_metric_query_with_facts(&plan, &result, Some(&facts));
+
+        assert!(summary.contains("12 complete buckets"));
+        assert!(summary.contains("2026-05-04"));
+        assert!(summary.contains("2026-07-20"));
+        assert!(summary.contains("Largest increase: 2026-06-15 to 2026-06-22 (+58)"));
+        assert!(summary.contains("Largest decline: 2026-05-18 to 2026-05-25 (-19)"));
+        assert!(summary.contains("The first and last buckets are partial"));
+
+        // Critical regression:
+        // the partial ending week must not become the decline claim.
+        assert!(!summary.contains("Largest decline: 2026-07-20 to 2026-07-27"));
     }
 }
