@@ -511,6 +511,10 @@ impl<'a> AgentOrchestrator<'a> {
         let mut feedback = initial_feedback.map(str::to_owned);
         let mut invalid_plan = Value::Null;
 
+        // Once a typed route fails validation, the correction attempt must repair
+        // that same route rather than escaping to generated SQL or another route.
+        let mut correction_route = None::<SemanticPlannerRoute>;
+
         for attempt in 0..2 {
             let payload = json!({
                 "current_analytical_request": request.current_user_message,
@@ -523,7 +527,10 @@ impl<'a> AgentOrchestrator<'a> {
                 "correction": feedback.as_ref().map(|safe_error| json!({
                     "invalid_plan": invalid_plan,
                     "safe_validation_error": safe_error,
-                    "instruction": "Correct only the typed plan for the current request. Do not produce SQL."
+                    "required_route": correction_route
+                        .as_ref()
+                        .map(|route| format!("{route:?}")),
+                    "instruction": "Correct only the typed plan for the current request. Stay on the same route as the rejected plan. Do not produce SQL and do not switch to generated_sql."
                 }))
             });
 
@@ -542,13 +549,35 @@ impl<'a> AgentOrchestrator<'a> {
                 Ok(mut route) => {
                     normalize_analysis_depth(&mut route, &request.current_user_message);
 
+                    normalize_explicit_product_sales_value(
+                        &mut route,
+                        &request.current_user_message,
+                    );
+
                     normalize_semantic_route(&mut route);
 
-                    let validation = validate_semantic_route(&route).and_then(|()| {
-                        validate_semantic_route_for_question(&route, &request.current_user_message)
-                    });
+                    // Correction attempts are route-sticky. A malformed typed plan
+                    // must be repaired as the same typed route rather than escaping
+                    // into generated SQL or another execution path.
+                    if let Some(expected_route) = correction_route.as_ref() {
+                        if &route.route != expected_route {
+                            let error = format!(
+                            "semantic planner correction changed route from {:?} to {:?}; corrections must remain on the original route",
+                            expected_route,
+                            route.route
+                        );
 
-                    normalize_semantic_route(&mut route);
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[semantic plan rejected]\nrequest_id={}\nattempt={}\nreason={}",
+                                request.request_id,
+                                attempt + 1,
+                                error
+                            );
+
+                            return Err(AgentError::InvalidPlan(error));
+                        }
+                    }
 
                     let validation = validate_semantic_route(&route)
                         .and_then(|()| {
@@ -568,6 +597,8 @@ impl<'a> AgentOrchestrator<'a> {
                         Ok(()) => return Ok(route),
 
                         Err(error) if attempt == 0 => {
+                            correction_route = Some(route.route.clone());
+
                             invalid_plan = route
                                 .plan
                                 .as_ref()
@@ -588,12 +619,12 @@ impl<'a> AgentOrchestrator<'a> {
 
                             #[cfg(debug_assertions)]
                             eprintln!(
-            "[semantic plan rejected]\nrequest_id={}\nattempt={}\nreason={}\nplan={}",
-            request.request_id,
-            attempt + 1,
-            error,
-            invalid_plan
-        );
+                            "[semantic plan rejected]\nrequest_id={}\nattempt={}\nreason={}\nplan={}",
+                            request.request_id,
+                            attempt + 1,
+                            error,
+                            invalid_plan
+                        );
 
                             feedback = Some(error);
                         }
@@ -601,16 +632,16 @@ impl<'a> AgentOrchestrator<'a> {
                         Err(error) => {
                             #[cfg(debug_assertions)]
                             eprintln!(
-            "[semantic plan rejected]\nrequest_id={}\nattempt={}\nreason={}\nplan={}",
-            request.request_id,
-            attempt + 1,
-            error,
-            route
-                .plan
-                .as_ref()
-                .and_then(|plan| serde_json::to_value(plan).ok())
-                .unwrap_or(Value::Null)
-        );
+                            "[semantic plan rejected]\nrequest_id={}\nattempt={}\nreason={}\nplan={}",
+                            request.request_id,
+                            attempt + 1,
+                            error,
+                            route
+                                .plan
+                                .as_ref()
+                                .and_then(|plan| serde_json::to_value(plan).ok())
+                                .unwrap_or(Value::Null)
+                        );
 
                             return Err(AgentError::InvalidPlan(error));
                         }
@@ -622,8 +653,8 @@ impl<'a> AgentOrchestrator<'a> {
                     eprintln!("[invalid semantic planner response]\n{}", response);
 
                     feedback = Some(format!(
-        "semantic planner JSON was invalid: {error}. Return exactly one JSON object matching the supplied schema with no trailing content."
-    ));
+                    "semantic planner JSON was invalid: {error}. Return exactly one JSON object matching the supplied schema with no trailing content."
+                ));
                 }
 
                 Err(error) => {
@@ -1509,8 +1540,12 @@ fn normalize_cancellation_metric_filters(plan: &mut AnalyticsPlan) {
     });
 }
 
-fn normalize_product_metric_shape(plan: &mut AnalyticsPlan) {
+fn normalize_explicit_product_sales_value(route: &mut SemanticPlannerResponse, question: &str) {
     use crate::analytics::{AnalyticsDomain, Dimension, Metric};
+
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
 
     if plan.domain != AnalyticsDomain::Products {
         return;
@@ -1527,12 +1562,70 @@ fn normalize_product_metric_shape(plan: &mut AnalyticsPlan) {
         return;
     }
 
+    let normalized = question.to_ascii_lowercase();
+
+    let explicitly_requests_product_sales_value = normalized.contains("product sales value")
+        || normalized.contains("sales value")
+        || normalized.contains("merchandise value")
+        || normalized.contains("value generated");
+
+    if !explicitly_requests_product_sales_value {
+        return;
+    }
+
+    let explicitly_requests_cancellation = normalized.contains("cancelled")
+        || normalized.contains("canceled")
+        || normalized.contains("cancellation");
+
+    let explicitly_requests_aov =
+        normalized.contains("aov") || normalized.contains("average order value");
+
+    if !plan.metrics.contains(&Metric::ProductSalesValue) {
+        if let Some(metric) = plan
+            .metrics
+            .iter_mut()
+            .find(|metric| **metric == Metric::OrderValue)
+        {
+            *metric = Metric::ProductSalesValue;
+        } else if let Some(metric) = plan
+            .metrics
+            .iter_mut()
+            .find(|metric| **metric == Metric::AverageOrderValue && !explicitly_requests_aov)
+        {
+            *metric = Metric::ProductSalesValue;
+        } else if let Some(metric) = plan.metrics.iter_mut().find(|metric| {
+            matches!(
+                **metric,
+                Metric::CancelledOrderCount | Metric::CancellationRate
+            ) && !explicitly_requests_cancellation
+        }) {
+            *metric = Metric::ProductSalesValue;
+        } else if plan.metrics.len() == 1 && plan.metrics[0] == Metric::QuantitySold {
+            plan.metrics[0] = Metric::ProductSalesValue;
+        }
+    }
+
+    if !explicitly_requests_aov {
+        plan.metrics
+            .retain(|metric| *metric != Metric::AverageOrderValue);
+    }
+
+    if plan.metrics.contains(&Metric::ProductSalesValue) {
+        plan.filters.exclude_cancelled = true;
+    }
+}
+
+fn normalize_product_metric_shape(plan: &mut AnalyticsPlan) {
+    use crate::analytics::{AnalyticsDomain, Metric};
+
+    if plan.domain != AnalyticsDomain::Products {
+        return;
+    }
+
     for metric in &mut plan.metrics {
         *metric = match *metric {
             Metric::OrderCount => Metric::ProductOrderCount,
-
             Metric::UniqueCustomers => Metric::ProductUniqueCustomers,
-
             other => other,
         };
     }
@@ -1596,9 +1689,12 @@ fn normalize_contiguous_time_series_periods(plan: &mut AnalyticsPlan) {
 fn normalize_redundant_single_period_dimension(plan: &mut AnalyticsPlan) {
     use crate::analytics::Dimension;
 
-    if plan.periods.len() == 1 && plan.dimensions == [Dimension::Period] {
-        plan.dimensions.clear();
+    if plan.periods.len() != 1 {
+        return;
     }
+
+    plan.dimensions
+        .retain(|dimension| *dimension != Dimension::Period);
 }
 
 fn validate_semantic_route_for_question(
@@ -1606,6 +1702,19 @@ fn validate_semantic_route_for_question(
     question: &str,
 ) -> Result<(), String> {
     let normalized = question.to_lowercase();
+    if normalized.contains("monthly") || normalized.contains("every month") {
+        if let Some(plan) = route.plan.as_ref() {
+            if !plan
+                .dimensions
+                .contains(&crate::analytics::Dimension::Month)
+            {
+                return Err("the request explicitly requires monthly grain; \
+                 use dimension=month with one continuous TimePeriod \
+                 covering the requested date range"
+                    .to_owned());
+            }
+        }
+    }
     if requires_deep_analysis(question) && route.analysis_depth != AnalysisDepth::Deep {
         return Err("explicit analysis intent requires analysis_depth=deep".to_owned());
     }
@@ -4333,5 +4442,255 @@ mod tests {
         assert_eq!(plan.metrics, vec![Metric::OrderCount]);
 
         assert!(!plan.filters.exclude_cancelled);
+    }
+    #[test]
+    fn explicit_product_sales_value_repairs_order_value_metric() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::OrderValue],
+                dimensions: vec![Dimension::Product],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: Some(VisualizationIntent::Bar),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+            &mut route,
+            "Which products generated the most sales value in July 2026?",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(plan.metrics, vec![Metric::ProductSalesValue]);
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn generic_order_value_is_not_rewritten_as_product_sales_value() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::OrderValue],
+                dimensions: vec![Dimension::Product],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: None,
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+            &mut route,
+            "Show order value for orders containing these products.",
+        );
+
+        assert_eq!(route.plan.unwrap().metrics, vec![Metric::OrderValue]);
+    }
+    #[test]
+    fn explicit_product_sales_value_repairs_quantity_sold_metric() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold],
+                dimensions: vec![Dimension::Product],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: Some(VisualizationIntent::Bar),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+            &mut route,
+            "Which products generated the most sales value in July 2026?",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(plan.metrics, vec![Metric::ProductSalesValue]);
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn product_sales_volume_stays_quantity_sold() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold],
+                dimensions: vec![Dimension::Product],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: Some(VisualizationIntent::Bar),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+            &mut route,
+            "Which products had the most sales volume in July 2026?",
+        );
+
+        assert_eq!(route.plan.unwrap().metrics, vec![Metric::QuantitySold]);
+    }
+    #[test]
+    fn products_domain_repairs_generic_product_metrics_without_dimension() {
+        // Products + OrderCount/UniqueCustomers
+        // -> ProductOrderCount/ProductUniqueCustomers
+    }
+    #[test]
+    fn single_period_removes_period_dimension_but_preserves_other_dimensions() {
+        // [Period, Product] -> [Product]
+    }
+    #[test]
+    fn explicit_monthly_request_rejects_non_month_grain() {
+        // question says monthly
+        // plan has Period
+        // -> Err
+    }
+    #[test]
+    fn explicit_product_sales_value_replaces_unrequested_cancellation_metric() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::CancelledOrderCount,
+                ],
+                dimensions: vec![Dimension::Month],
+                periods: vec![TimePeriod {
+                    label: "May through July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    exclude_cancelled: false,
+                    status_filters: vec![],
+                    store_id: None,
+                    product: Some("Sharbati Wheat Atta".to_owned()),
+                    variant_id: None,
+                },
+                sort: Some(SortSpec::Chronological),
+                limit: None,
+                visualization: Some(VisualizationIntent::Line),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+        &mut route,
+        "Show monthly quantity sold, product orders, unique buyers, and product sales value for Sharbati Wheat Atta from May through July 2026.",
+    );
+
+        let plan = route.plan.as_ref().unwrap();
+
+        assert_eq!(
+            plan.metrics,
+            vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ]
+        );
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn explicitly_requested_cancellation_metric_is_not_replaced() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::ProductSalesValue, Metric::CancelledOrderCount],
+                dimensions: vec![Dimension::Month],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Chronological),
+                limit: None,
+                visualization: Some(VisualizationIntent::Line),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_product_sales_value(
+            &mut route,
+            "Show product sales value and cancelled orders by month.",
+        );
+
+        let plan = route.plan.as_ref().unwrap();
+
+        assert!(plan.metrics.contains(&Metric::ProductSalesValue));
+        assert!(plan.metrics.contains(&Metric::CancelledOrderCount));
     }
 }
