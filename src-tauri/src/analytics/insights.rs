@@ -182,6 +182,14 @@ fn single_metric_fact_summary(
     )
 }
 
+fn multi_metric_integrity_note(plan: &AnalyticsPlan) -> &'static str {
+    if plan.metrics.iter().all(|metric| metric.is_order_grain()) {
+        " These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV."
+    } else {
+        ""
+    }
+}
+
 fn multi_metric_fact_summary(plan: &AnalyticsPlan, facts: &AnalyticalFacts) -> String {
     let mut summaries = Vec::new();
     let mut first_label = None::<String>;
@@ -240,11 +248,12 @@ fn multi_metric_fact_summary(plan: &AnalyticsPlan, facts: &AnalyticalFacts) -> S
     let last_label = last_label.unwrap_or_else(|| "last complete bucket".to_owned());
 
     format!(
-        "Across {} complete buckets from {} through {}, {}. These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV.{}",
+        "Across {} complete buckets from {} through {}, {}.{}{}",
         facts.complete_bucket_count,
         first_label,
         last_label,
         summaries.join(", while "),
+        multi_metric_integrity_note(plan),
         partial_bucket_note(facts)
     )
 }
@@ -274,7 +283,11 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
             .unwrap_or(0.0);
         if matches!(
             metric,
-            Metric::OrderCount | Metric::UniqueCustomers | Metric::CancelledOrderCount
+            Metric::OrderCount
+                | Metric::UniqueCustomers
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::CancelledOrderCount
         ) {
             return format!(
                 "There were {} {} for {}.",
@@ -301,7 +314,11 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
     if points.len() == 1 {
         if matches!(
             metric,
-            Metric::OrderCount | Metric::UniqueCustomers | Metric::CancelledOrderCount
+            Metric::OrderCount
+                | Metric::UniqueCustomers
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::CancelledOrderCount
         ) {
             return format!(
                 "There were {} {} for {}.",
@@ -411,12 +428,21 @@ fn multi_metric_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
             ))
         })
         .collect::<Vec<_>>();
-    format!("Across {} through {}, {}. These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV.", first_label, last_label, facts.join(", while "))
+    format!(
+        "Across {} through {}, {}.{}",
+        first_label,
+        last_label,
+        facts.join(", while "),
+        multi_metric_integrity_note(plan)
+    )
 }
 
 fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
-    let key = plan.metrics[0].value_key();
+    let metric = plan.metrics[0];
+    let key = metric.value_key();
+
     let mut rankings = Vec::<(String, Vec<(String, f64)>)>::new();
+
     for row in &result.rows {
         let period = row
             .get("period")
@@ -424,6 +450,7 @@ fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
             .or_else(|| plan.periods.first().map(|period| period.label.as_str()))
             .unwrap_or("Requested period")
             .to_owned();
+
         let item = if plan.dimensions.contains(&Dimension::Product) {
             row.get("product_name")
                 .or_else(|| row.get("historical_product_label"))
@@ -435,36 +462,60 @@ fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
         .and_then(Value::as_str)
         .unwrap_or("Unnamed item")
         .to_owned();
+
         let value = row.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+
         if let Some(existing) = rankings.iter_mut().find(|entry| entry.0 == period) {
             existing.1.push((item, value));
         } else {
             rankings.push((period, vec![(item, value)]));
         }
     }
+
     rankings
         .into_iter()
         .filter_map(|(period, points)| {
             let leader = points.first()?;
-            let runner_gap = points
-                .get(1)
-                .map(|runner| leader.1 - runner.1)
-                .unwrap_or(0.0);
-            let top3 = points.iter().take(3).map(|point| point.1).sum::<f64>();
-            let top5 = points.iter().take(5).map(|point| point.1).sum::<f64>();
-            let total = points.iter().map(|point| point.1).sum::<f64>();
-            Some(format!(
-                "For {period}, {} leads with {}, a {:.0}-unit gap over the runner-up; top 3 total {:.0}, top 5 total {:.0}, and returned top-N totals {:.0}.",
+
+            let gap = points.get(1).map(|runner| leader.1 - runner.1);
+
+            let mut summary = format!(
+                "For {period}, {} leads with {}",
                 leader.0,
-                format_value(plan.metrics[0], leader.1),
-                runner_gap,
-                top3,
-                top5,
-                total
-            ))
+                format_value(metric, leader.1)
+            );
+
+            if let Some(gap) = gap {
+                summary.push_str(&format!(
+                    ", ahead of the runner-up by {}",
+                    format_value(metric, gap)
+                ));
+            }
+
+            if ranking_metric_is_additive(metric) {
+                let top3 = points.iter().take(3).map(|point| point.1).sum::<f64>();
+
+                let top5 = points.iter().take(5).map(|point| point.1).sum::<f64>();
+
+                let returned_total = points.iter().map(|point| point.1).sum::<f64>();
+
+                summary.push_str(&format!(
+                    "; top 3 total {}, top 5 total {}, and returned top-N total {}",
+                    format_value(metric, top3),
+                    format_value(metric, top5),
+                    format_value(metric, returned_total)
+                ));
+            }
+
+            summary.push('.');
+            Some(summary)
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn ranking_metric_is_additive(metric: Metric) -> bool {
+    matches!(metric, Metric::QuantitySold | Metric::ProductSalesValue)
 }
 
 fn status_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
@@ -653,12 +704,17 @@ fn metric_label(metric: Metric) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "average item quantity per order",
         Metric::CancelledOrderCount => "cancelled orders",
         Metric::CancellationRate => "cancellation rate",
+        Metric::ProductOrderCount => "product orders",
+        Metric::ProductUniqueCustomers => "unique product buyers",
+        Metric::ProductSalesValue => "product sales value",
     }
 }
 
 fn format_value(metric: Metric, value: f64) -> String {
     match metric {
-        Metric::OrderValue | Metric::AverageOrderValue => format_currency(value),
+        Metric::OrderValue | Metric::AverageOrderValue | Metric::ProductSalesValue => {
+            format_currency(value)
+        }
         Metric::CancellationRate => format!("{value:.1}%"),
         _ => format!("{value:.0}"),
     }
@@ -879,5 +935,30 @@ mod tests {
         // Critical regression:
         // the partial ending week must not become the decline claim.
         assert!(!summary.contains("Largest decline: 2026-07-20 to 2026-07-27"));
+    }
+    #[test]
+    fn product_multi_metric_summary_does_not_claim_order_grain_aggregation() {
+        assert_eq!(
+            multi_metric_integrity_note(&AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![Dimension::Month],
+                periods: vec![TimePeriod {
+                    label: "May through July".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Chronological),
+                limit: None,
+                visualization: Some(VisualizationIntent::Line),
+            }),
+            ""
+        );
     }
 }

@@ -106,7 +106,11 @@ pub(crate) fn parse_semantic_plan(
         | Metric::CancelledOrderCount
         | Metric::CancellationRate => AnalyticsDomain::Operations,
         Metric::UniqueCustomers => AnalyticsDomain::Customers,
-        Metric::QuantitySold | Metric::UniqueVariants => AnalyticsDomain::Products,
+        Metric::QuantitySold
+        | Metric::ProductOrderCount
+        | Metric::ProductUniqueCustomers
+        | Metric::ProductSalesValue
+        | Metric::UniqueVariants => AnalyticsDomain::Products,
     };
     let status_filters = parse_status_filters(&normalized);
     let filters = AnalyticsFilters {

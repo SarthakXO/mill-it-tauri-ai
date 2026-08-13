@@ -19,8 +19,13 @@ pub(crate) enum AnalyticsDomain {
 pub(crate) enum Metric {
     OrderCount,
     UniqueCustomers,
+
     QuantitySold,
+    ProductOrderCount,
+    ProductUniqueCustomers,
+    ProductSalesValue,
     UniqueVariants,
+
     OrderValue,
     AverageOrderValue,
     AverageItemQuantityPerOrder,
@@ -40,6 +45,9 @@ impl Metric {
             Self::AverageItemQuantityPerOrder => "average_item_quantity_per_order",
             Self::CancelledOrderCount => "cancelled_order_count",
             Self::CancellationRate => "cancellation_rate",
+            Self::ProductOrderCount => "product_order_count",
+            Self::ProductUniqueCustomers => "product_unique_customers",
+            Self::ProductSalesValue => "product_sales_value",
         }
     }
 
@@ -235,7 +243,11 @@ fn validate_domain_metric(
             | (AnalyticsDomain::Customers, Metric::UniqueCustomers)
             | (
                 AnalyticsDomain::Products,
-                Metric::QuantitySold | Metric::UniqueVariants
+                Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
+                    | Metric::UniqueVariants
             )
     );
     valid.then_some(()).ok_or(PlanValidationError::DomainMetric)
@@ -284,7 +296,10 @@ fn validate_dimensions(
                 | Dimension::Period
                 | Dimension::Store
         ),
-        Metric::QuantitySold => !matches!(
+        Metric::QuantitySold
+        | Metric::ProductOrderCount
+        | Metric::ProductUniqueCustomers
+        | Metric::ProductSalesValue => !matches!(
             dimension,
             Dimension::Day
                 | Dimension::Week
@@ -338,10 +353,16 @@ fn validate_filters(plan: &MetricQueryPlan) -> Result<(), PlanValidationError> {
         return Err(PlanValidationError::UnsupportedFilter);
     }
     if (plan.filters.product.is_some() || plan.filters.variant_id.is_some())
-        && plan
-            .metrics
-            .iter()
-            .any(|metric| !matches!(metric, Metric::QuantitySold | Metric::UniqueVariants))
+        && plan.metrics.iter().any(|metric| {
+            !matches!(
+                metric,
+                Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
+                    | Metric::UniqueVariants
+            )
+        })
     {
         return Err(PlanValidationError::UnsupportedFilter);
     }

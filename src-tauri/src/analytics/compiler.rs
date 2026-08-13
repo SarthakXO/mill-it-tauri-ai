@@ -38,10 +38,21 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
             Metric::OrderValue | Metric::AverageOrderValue | Metric::AverageItemQuantityPerOrder
         )
     });
-    let product_metric = plan
-        .metrics
-        .iter()
-        .any(|metric| matches!(metric, Metric::QuantitySold | Metric::UniqueVariants));
+    let product_metric = plan.metrics.iter().any(|metric| {
+        matches!(
+            metric,
+            Metric::QuantitySold
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::ProductSalesValue
+                | Metric::UniqueVariants
+        )
+    });
+    let catalogue_scoped_product_query = product_dimension
+        || variant_dimension
+        || plan.filters.product.is_some()
+        || plan.filters.variant_id.is_some();
+
     let mut joins = if product_metric {
         format!(" JOIN line_item AS li ON li.order_id = o.id{PARTIAL_CANCEL_QUANTITY_JOIN}")
     } else if needs_order_items {
@@ -49,10 +60,7 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
     } else {
         String::new()
     };
-    let needs_variant_join = variant_dimension
-        || product_dimension
-        || plan.filters.product.is_some()
-        || plan.filters.variant_id.is_some();
+    let needs_variant_join = catalogue_scoped_product_query;
     if needs_variant_join {
         joins.push_str(" LEFT JOIN product_variant AS pv ON pv.id = li.variant_id LEFT JOIN product AS p ON p.id = pv.product_id");
     }
@@ -76,6 +84,9 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
                 metric,
                 Metric::UniqueCustomers
                     | Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
                     | Metric::UniqueVariants
                     | Metric::OrderValue
                     | Metric::AverageOrderValue
@@ -86,7 +97,19 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
         where_parts.push(QUALIFYING_SALE_FILTER.to_owned());
     }
     if product_metric {
-        where_parts.push("li.variant_id IS NOT NULL".to_owned());
+        where_parts.extend([
+            "li.variant_id IS NOT NULL".to_owned(),
+            "li.is_return = false".to_owned(),
+            "GREATEST(li.quantity::bigint - COALESCE(pcq.partial_cancelled_qty, 0), 0) > 0"
+                .to_owned(),
+        ]);
+    }
+
+    if catalogue_scoped_product_query {
+        where_parts.extend([
+            "p.deleted_at IS NULL".to_owned(),
+            "lower(COALESCE(p.status::text, '')) = 'published'".to_owned(),
+        ]);
     }
     if product_dimension {
         where_parts.push("pv.product_id IS NOT NULL".to_owned());
@@ -343,6 +366,15 @@ fn metric_aggregate(metric: Metric) -> &'static str {
         Metric::CancellationRate => {
             "100.0 * COUNT(*) FILTER (WHERE (lower(o.status::text) IN ('canceled', 'cancelled') OR upper(COALESCE(o.zoho_order_status, '')) IN ('CANCELED', 'CANCELLED'))) / NULLIF(COUNT(*), 0)"
         }
+        Metric::ProductOrderCount => "COUNT(DISTINCT o.id)",
+
+Metric::ProductUniqueCustomers => {
+    "COUNT(DISTINCT o.customer_id)"
+}
+
+Metric::ProductSalesValue => {
+    "SUM(COALESCE(li.unit_price, 0)::bigint * GREATEST(li.quantity::bigint - COALESCE(pcq.partial_cancelled_qty, 0), 0)) / 100.0"
+}
     }
 }
 
@@ -357,6 +389,17 @@ fn metric_expression(metric: Metric) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "AVG(COALESCE(oi.item_quantity, 0)) AS average_item_quantity_per_order",
         Metric::CancelledOrderCount => "COUNT(*) FILTER (WHERE (lower(o.status::text) IN ('canceled', 'cancelled') OR upper(COALESCE(o.zoho_order_status, '')) IN ('CANCELED', 'CANCELLED'))) AS cancelled_order_count",
         Metric::CancellationRate => "100.0 * COUNT(*) FILTER (WHERE (lower(o.status::text) IN ('canceled', 'cancelled') OR upper(COALESCE(o.zoho_order_status, '')) IN ('CANCELED', 'CANCELLED'))) / NULLIF(COUNT(*), 0) AS cancellation_rate",
+        Metric::ProductOrderCount => {
+    "COUNT(DISTINCT o.id) AS product_order_count"
+}
+
+Metric::ProductUniqueCustomers => {
+    "COUNT(DISTINCT o.customer_id) AS product_unique_customers"
+}
+
+Metric::ProductSalesValue => {
+    "SUM(COALESCE(li.unit_price, 0)::bigint * GREATEST(li.quantity::bigint - COALESCE(pcq.partial_cancelled_qty, 0), 0)) / 100.0 AS product_sales_value"
+}
     }
 }
 
@@ -632,5 +675,129 @@ mod tests {
 
         assert!(compiled.sql.contains("COUNT(*) AS order_count"));
         assert!(!compiled.sql.contains(QUALIFYING_SALE_FILTER));
+    }
+    #[test]
+    fn product_metrics_use_published_product_grain_and_net_sales() {
+        let mut plan = base_plan(Metric::QuantitySold, AnalyticsDomain::Products);
+
+        plan.metrics = vec![
+            Metric::QuantitySold,
+            Metric::ProductOrderCount,
+            Metric::ProductUniqueCustomers,
+            Metric::ProductSalesValue,
+        ];
+
+        plan.dimensions = vec![Dimension::Product];
+        plan.sort = Some(SortSpec::Descending);
+
+        let compiled = compile(&plan).unwrap();
+
+        validate_sql(&compiled.sql).expect("product metric SQL must pass AST safety");
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.id) AS product_order_count"));
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.customer_id) AS product_unique_customers"));
+
+        assert!(compiled.sql.contains("COALESCE(li.unit_price, 0)::bigint"));
+
+        assert!(compiled
+            .sql
+            .contains("COALESCE(pcq.partial_cancelled_qty, 0)"));
+
+        assert!(compiled.sql.contains("li.is_return = false"));
+
+        assert!(compiled.sql.contains("p.deleted_at IS NULL"));
+
+        assert!(compiled
+            .sql
+            .contains("lower(COALESCE(p.status::text, '')) = 'published'"));
+
+        assert!(compiled.sql.contains(QUALIFYING_SALE_FILTER));
+
+        let (_, grouping_tail) = compiled
+            .sql
+            .rsplit_once(" GROUP BY ")
+            .expect("product metrics must group");
+
+        let grouping = grouping_tail
+            .split(" ORDER BY ")
+            .next()
+            .expect("grouping must precede ordering");
+
+        assert_eq!(grouping.trim(), "pv.product_id");
+
+        assert!(!grouping.contains("li.variant_id"));
+        assert!(!grouping.contains("li.title"));
+    }
+    #[test]
+    fn variant_metrics_remain_variant_grain_inside_published_products() {
+        let mut plan = base_plan(Metric::ProductOrderCount, AnalyticsDomain::Products);
+
+        plan.metrics = vec![
+            Metric::QuantitySold,
+            Metric::ProductOrderCount,
+            Metric::ProductUniqueCustomers,
+            Metric::ProductSalesValue,
+        ];
+
+        plan.dimensions = vec![Dimension::Variant];
+        plan.sort = Some(SortSpec::Descending);
+
+        let compiled = compile(&plan).unwrap();
+
+        validate_sql(&compiled.sql).expect("variant metric SQL must pass AST safety");
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.id) AS product_order_count"));
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.customer_id) AS product_unique_customers"));
+
+        assert!(compiled
+            .sql
+            .contains("lower(COALESCE(p.status::text, '')) = 'published'"));
+
+        // Historical variants are deliberately retained.
+        assert!(!compiled.sql.contains("pv.deleted_at IS NULL"));
+
+        let (_, grouping_tail) = compiled
+            .sql
+            .rsplit_once(" GROUP BY ")
+            .expect("variant metrics must group");
+
+        let grouping = grouping_tail
+            .split(" ORDER BY ")
+            .next()
+            .expect("grouping must precede ordering");
+
+        assert_eq!(grouping.trim(), "li.variant_id");
+    }
+    #[test]
+    fn aggregate_product_history_is_not_filtered_by_current_catalogue_state() {
+        let mut plan = base_plan(Metric::ProductSalesValue, AnalyticsDomain::Products);
+
+        plan.dimensions = vec![Dimension::Month];
+        plan.sort = Some(SortSpec::Chronological);
+
+        let compiled = compile(&plan).unwrap();
+
+        validate_sql(&compiled.sql).expect("historical product metric SQL must pass AST safety");
+
+        assert!(compiled.sql.contains(QUALIFYING_SALE_FILTER));
+        assert!(compiled.sql.contains("li.is_return = false"));
+        assert!(compiled
+            .sql
+            .contains("COALESCE(pcq.partial_cancelled_qty, 0)"));
+
+        assert!(!compiled.sql.contains("p.deleted_at IS NULL"));
+        assert!(!compiled
+            .sql
+            .contains("lower(COALESCE(p.status::text, '')) = 'published'"));
     }
 }

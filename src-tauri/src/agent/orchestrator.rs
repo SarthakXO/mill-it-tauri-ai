@@ -540,6 +540,14 @@ impl<'a> AgentOrchestrator<'a> {
 
             match parsed {
                 Ok(mut route) => {
+                    normalize_analysis_depth(&mut route, &request.current_user_message);
+
+                    normalize_semantic_route(&mut route);
+
+                    let validation = validate_semantic_route(&route).and_then(|()| {
+                        validate_semantic_route_for_question(&route, &request.current_user_message)
+                    });
+
                     normalize_semantic_route(&mut route);
 
                     let validation = validate_semantic_route(&route)
@@ -1342,6 +1350,47 @@ fn validate_semantic_route(route: &SemanticPlannerResponse) -> Result<(), String
         SemanticPlannerRoute::Conversation | SemanticPlannerRoute::Blocked => Ok(()),
     }
 }
+fn normalize_analysis_depth(route: &mut SemanticPlannerResponse, question: &str) {
+    if matches!(
+        route.route,
+        SemanticPlannerRoute::Conversation | SemanticPlannerRoute::Blocked
+    ) {
+        return;
+    }
+
+    if requires_deep_analysis(question) {
+        route.analysis_depth = AnalysisDepth::Deep;
+    }
+}
+
+fn requires_deep_analysis(question: &str) -> bool {
+    let normalized = question.to_ascii_lowercase();
+
+    if normalized.contains("what stands out") {
+        return true;
+    }
+
+    let tokens = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty());
+
+    tokens.into_iter().any(|token| {
+        matches!(
+            token,
+            "analyze"
+                | "analyse"
+                | "analysis"
+                | "explain"
+                | "interpret"
+                | "investigate"
+                | "insight"
+                | "insights"
+                | "pattern"
+                | "patterns"
+                | "why"
+        )
+    })
+}
 
 fn normalize_semantic_route(route: &mut SemanticPlannerResponse) {
     normalize_simple_unique_customer_count(route);
@@ -1350,6 +1399,7 @@ fn normalize_semantic_route(route: &mut SemanticPlannerResponse) {
         return;
     };
 
+    normalize_product_metric_shape(plan);
     normalize_contiguous_time_series_periods(plan);
     normalize_redundant_single_period_dimension(plan);
     normalize_cancellation_metric_filters(plan);
@@ -1459,6 +1509,48 @@ fn normalize_cancellation_metric_filters(plan: &mut AnalyticsPlan) {
     });
 }
 
+fn normalize_product_metric_shape(plan: &mut AnalyticsPlan) {
+    use crate::analytics::{AnalyticsDomain, Dimension, Metric};
+
+    if plan.domain != AnalyticsDomain::Products {
+        return;
+    }
+
+    let product_scoped = plan
+        .dimensions
+        .iter()
+        .any(|dimension| matches!(dimension, Dimension::Product | Dimension::Variant))
+        || plan.filters.product.is_some()
+        || plan.filters.variant_id.is_some();
+
+    if !product_scoped {
+        return;
+    }
+
+    for metric in &mut plan.metrics {
+        *metric = match *metric {
+            Metric::OrderCount => Metric::ProductOrderCount,
+
+            Metric::UniqueCustomers => Metric::ProductUniqueCustomers,
+
+            other => other,
+        };
+    }
+
+    if plan.metrics.iter().any(|metric| {
+        matches!(
+            metric,
+            Metric::QuantitySold
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::ProductSalesValue
+                | Metric::UniqueVariants
+        )
+    }) {
+        plan.filters.exclude_cancelled = true;
+    }
+}
+
 fn normalize_contiguous_time_series_periods(plan: &mut AnalyticsPlan) {
     use crate::analytics::Dimension;
 
@@ -1514,6 +1606,9 @@ fn validate_semantic_route_for_question(
     question: &str,
 ) -> Result<(), String> {
     let normalized = question.to_lowercase();
+    if requires_deep_analysis(question) && route.analysis_depth != AnalysisDepth::Deep {
+        return Err("explicit analysis intent requires analysis_depth=deep".to_owned());
+    }
     if route.plan.as_ref().is_some_and(|plan| {
         plan.metrics
             .contains(&crate::analytics::Metric::AverageItemQuantityPerOrder)
@@ -2596,6 +2691,11 @@ impl Error for AgentError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::{
+        AnalyticsDomain, AnalyticsFilters, Dimension, Metric, SortSpec, TimePeriod,
+        VisualizationIntent,
+    };
+    use chrono::NaiveDate;
 
     #[test]
     fn blocks_natural_language_mutations_before_any_database_use() {
@@ -4127,5 +4227,111 @@ mod tests {
         assert_eq!(route.route, SemanticPlannerRoute::EntityList);
         assert_eq!(route.entity_plan, Some(original_entity_plan));
         assert!(route.plan.is_none());
+    }
+    #[test]
+    fn explicit_analysis_intent_is_normalized_to_deep() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: None,
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_analysis_depth(&mut route, "Analyze our monthly order volume.");
+
+        assert_eq!(route.analysis_depth, AnalysisDepth::Deep);
+    }
+
+    #[test]
+    fn ordinary_reporting_does_not_force_deep_analysis() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: None,
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_analysis_depth(&mut route, "Show our monthly order volume.");
+
+        assert_eq!(route.analysis_depth, AnalysisDepth::Summary);
+    }
+    #[test]
+    fn product_dimension_normalizes_order_count_to_product_order_count() {
+        let mut plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![Dimension::Product],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Descending),
+            limit: Some(10),
+            visualization: Some(VisualizationIntent::HorizontalBar),
+        };
+
+        normalize_product_metric_shape(&mut plan);
+
+        assert_eq!(plan.metrics, vec![Metric::ProductOrderCount]);
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn variant_dimension_normalizes_unique_customers_to_product_buyers() {
+        let mut plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![Metric::UniqueCustomers],
+            dimensions: vec![Dimension::Variant],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Descending),
+            limit: Some(10),
+            visualization: Some(VisualizationIntent::HorizontalBar),
+        };
+
+        normalize_product_metric_shape(&mut plan);
+
+        assert_eq!(plan.metrics, vec![Metric::ProductUniqueCustomers]);
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn ordinary_order_count_is_not_changed_by_product_normalizer() {
+        let mut plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Operations,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: None,
+            limit: None,
+            visualization: None,
+        };
+
+        normalize_product_metric_shape(&mut plan);
+
+        assert_eq!(plan.metrics, vec![Metric::OrderCount]);
+
+        assert!(!plan.filters.exclude_cancelled);
     }
 }

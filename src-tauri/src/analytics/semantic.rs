@@ -1,6 +1,6 @@
 use super::{
     compiler::{compile, CompiledAnalyticsQuery},
-    facts::{build_time_series_facts, AnalyticalFacts},
+    facts::build_time_series_facts,
     insights::summarize_metric_query_with_facts,
     plan::{AnalyticsPlan, Dimension, Metric, VisualizationIntent},
 };
@@ -219,6 +219,11 @@ fn semantic_intent(plan: &AnalyticsPlan) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "semantic average item quantity per order",
         Metric::CancelledOrderCount => "semantic cancelled order count",
         Metric::CancellationRate => "semantic cancellation rate",
+        Metric::ProductOrderCount => "semantic product order count",
+
+        Metric::ProductUniqueCustomers => "semantic product unique buyer count",
+
+        Metric::ProductSalesValue => "semantic product merchandise sales value",
     }
 }
 
@@ -233,6 +238,9 @@ fn chart_title(plan: &AnalyticsPlan) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "Average item quantity per order",
         Metric::CancelledOrderCount => "Cancelled orders",
         Metric::CancellationRate => "Cancellation rate",
+        Metric::ProductOrderCount => "Product orders",
+        Metric::ProductUniqueCustomers => "Product buyers",
+        Metric::ProductSalesValue => "Product sales value",
     }
 }
 
