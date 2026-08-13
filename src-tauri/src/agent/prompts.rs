@@ -152,6 +152,68 @@ Routing rules:
 - Use generated_sql only for a legitimate read-only analytical request that cannot be represented by the typed analytics plan, entity plan, forecast plan, or supported specialized tools.
 - Use conversation for greetings or non-database conversation.
 - Use blocked for mutations, prohibited sensitive-data requests, or requests outside the read-only analytics policy.
+- A single named-product performance snapshot that can be represented by the typed product metrics MUST use analytics_plan, not specialized_tool.
+- "Show performance of [named product] in [period]" means the four core product-performance metrics:
+  quantity_sold,
+  product_order_count,
+  product_unique_customers,
+  product_sales_value.
+- For that named-product performance snapshot:
+  domain=products
+  dimensions=[]
+  filters.product=<named product>
+  filters.exclude_cancelled=true
+  sort=null
+  limit=null
+  visualization=table
+- specialized_tool=product_performance is reserved for comparative product/SKU performance algorithms that require distinct current and baseline windows, such as "Which SKUs performed worse in June compared with May?"
+- Do not use specialized_tool=product_performance for a single named-product performance snapshot.
+
+Canonical named-product performance example:
+
+User request:
+"Show performance of MP Sharbati Atta in July 2026."
+
+Return semantics equivalent to:
+
+route=analytics_plan
+analysis_depth=summary
+
+domain=products
+
+metrics=[
+  quantity_sold,
+  product_order_count,
+  product_unique_customers,
+  product_sales_value
+]
+
+dimensions=[]
+
+periods=[
+  {
+    "label":"July 2026",
+    "start":"2026-07-01",
+    "end_exclusive":"2026-08-01"
+  }
+]
+
+filters={
+  "exclude_cancelled":true,
+  "status_filters":[],
+  "store_id":null,
+  "product":"MP Sharbati Atta",
+  "variant_id":null
+}
+
+sort=null
+limit=null
+visualization=table
+
+The named product is a filter.
+Do not add dimension=product.
+Do not add dimension=variant.
+Rust owns automatic variant expansion after the typed product plan executes.
 
 Period-shape rules:
 - A continuous time-series request across a contiguous date range uses one TimePeriod covering the full range.

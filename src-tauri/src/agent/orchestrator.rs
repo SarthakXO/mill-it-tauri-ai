@@ -568,6 +568,11 @@ impl<'a> AgentOrchestrator<'a> {
                 Ok(mut route) => {
                     normalize_analysis_depth(&mut route, &request.current_user_message);
 
+                    normalize_named_product_performance_snapshot(
+                        &mut route,
+                        &request.current_user_message,
+                    );
+
                     normalize_explicit_product_sales_value(
                         &mut route,
                         &request.current_user_message,
@@ -1582,6 +1587,94 @@ fn normalize_cancellation_metric_filters(plan: &mut AnalyticsPlan) {
 
         !(is_cancellation_status_dimension && contains_only_cancellation_values)
     });
+}
+
+fn normalize_named_product_performance_snapshot(
+    route: &mut SemanticPlannerResponse,
+    question: &str,
+) {
+    use crate::analytics::{AnalyticsDomain, Dimension, Metric, VisualizationIntent};
+
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    if plan.domain != AnalyticsDomain::Products {
+        return;
+    }
+
+    /*
+     * Automatic product-performance shorthand is intentionally narrow:
+     *
+     * - one named product
+     * - one requested period
+     * - no explicit grouping
+     * - no explicit variant request
+     *
+     * Comparative/ranking/time-series product performance remains owned by
+     * its existing typed/specialized routes.
+     */
+    if plan.filters.product.is_none() || plan.periods.len() != 1 || !plan.dimensions.is_empty() {
+        return;
+    }
+
+    let normalized = question.to_ascii_lowercase();
+
+    let requests_performance = normalized.contains("performance")
+        || normalized.contains("performing")
+        || normalized.contains("performed")
+        || normalized.contains("how did") && normalized.contains("perform");
+
+    if !requests_performance {
+        return;
+    }
+
+    /*
+     * If the user explicitly asks for a narrower metric, do not expand it
+     * into the complete performance snapshot.
+     */
+    let explicitly_requests_specific_metric = normalized.contains("quantity sold")
+        || normalized.contains("units sold")
+        || normalized.contains("sales volume")
+        || normalized.contains("product orders")
+        || normalized.contains("order count")
+        || normalized.contains("unique buyers")
+        || normalized.contains("unique customers")
+        || normalized.contains("sales value")
+        || normalized.contains("merchandise value")
+        || normalized.contains("value generated")
+        || normalized.contains("aov")
+        || normalized.contains("average order value");
+
+    if explicitly_requests_specific_metric {
+        return;
+    }
+
+    /*
+     * Named-product "performance" has one canonical core metric set.
+     *
+     * Parent order and buyer metrics remain independently computed at
+     * product grain; they are never derived from variant rows.
+     */
+    plan.metrics = vec![
+        Metric::QuantitySold,
+        Metric::ProductOrderCount,
+        Metric::ProductUniqueCustomers,
+        Metric::ProductSalesValue,
+    ];
+
+    plan.filters.exclude_cancelled = true;
+    plan.sort = None;
+    plan.limit = None;
+    plan.visualization = Some(VisualizationIntent::Table);
+
+    /*
+     * Do not add Product or Variant dimensions here.
+     * The parent remains scalar product performance.
+     * Rust's B2 semantic executor derives the variant expansion separately.
+     */
+    plan.dimensions
+        .retain(|dimension| !matches!(dimension, Dimension::Product | Dimension::Variant));
 }
 
 fn normalize_explicit_product_sales_value(route: &mut SemanticPlannerResponse, question: &str) {
@@ -4876,5 +4969,99 @@ mod tests {
         )
         .is_ok()
     );
+    }
+    #[test]
+    fn named_product_performance_snapshot_uses_four_core_metrics() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::OrderValue,
+                ],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("MP Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_named_product_performance_snapshot(
+            &mut route,
+            "Show performance of MP Sharbati Atta in July 2026.",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(
+            plan.metrics,
+            vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ]
+        );
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.dimensions.is_empty());
+        assert_eq!(plan.limit, None);
+        assert_eq!(plan.visualization, Some(VisualizationIntent::Table));
+
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn explicit_named_product_metric_is_not_expanded_to_performance_snapshot() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("MP Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_named_product_performance_snapshot(
+            &mut route,
+            "Show quantity sold for MP Sharbati Atta in July 2026.",
+        );
+
+        assert_eq!(route.plan.unwrap().metrics, vec![Metric::QuantitySold]);
     }
 }

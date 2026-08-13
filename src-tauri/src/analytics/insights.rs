@@ -22,6 +22,9 @@ pub(crate) fn summarize_metric_query(plan: &AnalyticsPlan, result: &QueryResult)
             ranking_summary(plan, result)
         };
     }
+    if plan.dimensions.is_empty() && plan.metrics.len() > 1 && result.row_count == 1 {
+        return multi_metric_scalar_summary(plan, result);
+    }
 
     if plan.metrics.len() > 1 {
         return multi_metric_summary(plan, result);
@@ -405,6 +408,38 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
         increase,
         decline
     )
+}
+
+fn multi_metric_scalar_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
+    let Some(row) = result.rows.first() else {
+        return "No matching analytics data was found for the requested periods.".to_owned();
+    };
+
+    let values = plan
+        .metrics
+        .iter()
+        .filter_map(|metric| {
+            let value = row.get(metric.value_key())?.as_f64()?;
+
+            Some(format!(
+                "{} {}",
+                metric_label(*metric),
+                format_value(*metric, value)
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        return "No matching analytics data was found for the requested periods.".to_owned();
+    }
+
+    let period = plan
+        .periods
+        .first()
+        .map(|period| period.label.as_str())
+        .unwrap_or("the requested period");
+
+    format!("For {period}: {}.", values.join("; "))
 }
 
 fn multi_metric_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
@@ -1118,5 +1153,68 @@ mod tests {
         // Product-order and buyer counts are non-additive.
         assert!(!summary.contains("top 3 total"));
         assert!(!summary.contains("top 5 total"));
+    }
+
+    #[test]
+    fn product_performance_scalar_reports_each_metric_value() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+            sort: None,
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let mut row = Map::new();
+
+        row.insert("quantity_sold".to_owned(), Value::from(100));
+
+        row.insert("product_order_count".to_owned(), Value::from(70));
+
+        row.insert("product_unique_customers".to_owned(), Value::from(60));
+
+        row.insert("product_sales_value".to_owned(), Value::from(12_000.0));
+
+        let result = QueryResult {
+            columns: vec![
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![row],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let summary = summarize_metric_query(&plan, &result);
+
+        assert!(summary.contains("quantity sold 100"));
+
+        assert!(summary.contains("product orders 70"));
+
+        assert!(summary.contains("unique product buyers 60"));
+
+        assert!(summary.contains("product sales value ₹12,000.00"));
+
+        assert!(!summary.contains("percentage change"));
     }
 }

@@ -2,7 +2,7 @@ use super::{
     compiler::{compile, CompiledAnalyticsQuery},
     facts::build_time_series_facts,
     insights::summarize_metric_query_with_facts,
-    plan::{AnalyticsPlan, Dimension, Metric, VisualizationIntent},
+    plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
 };
 use crate::{
     agent::{AgentError, AgentResponse, ChartType, WarningBlock},
@@ -20,6 +20,75 @@ pub(crate) struct SemanticExecution {
     pub(crate) summary_duration_ms: u128,
 }
 
+fn is_core_product_performance_metric(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::QuantitySold
+            | Metric::ProductOrderCount
+            | Metric::ProductUniqueCustomers
+            | Metric::ProductSalesValue
+    )
+}
+
+fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> {
+    if plan.domain != AnalyticsDomain::Products {
+        return None;
+    }
+
+    let product = plan.filters.product.as_deref()?;
+
+    if product.trim().is_empty() {
+        return None;
+    }
+
+    // Explicit variant requests already have their requested grain.
+    if plan.dimensions.contains(&Dimension::Variant) {
+        return None;
+    }
+
+    // Multi-product/grouped requests belong to the later comparison layer.
+    if plan.dimensions.contains(&Dimension::Product) {
+        return None;
+    }
+
+    /*
+     * V1 auto-expansion is intentionally limited to a single-period,
+     * non-time-series product performance snapshot.
+     *
+     * Trend/momentum variant expansion belongs to 2E-D.
+     */
+    if !plan.dimensions.is_empty() || plan.periods.len() != 1 {
+        return None;
+    }
+
+    /*
+     * Require a genuine performance-style multi-metric query.
+     * This prevents a simple question such as:
+     *
+     * "How many units did X sell?"
+     *
+     * from unexpectedly expanding into a large variant table.
+     */
+    if plan.metrics.len() < 2
+        || !plan
+            .metrics
+            .iter()
+            .copied()
+            .all(is_core_product_performance_metric)
+    {
+        return None;
+    }
+
+    let mut variant_plan = plan.clone();
+
+    variant_plan.dimensions = vec![Dimension::Variant];
+    variant_plan.sort = Some(SortSpec::Descending);
+    variant_plan.limit = None;
+    variant_plan.visualization = Some(VisualizationIntent::Table);
+
+    Some(variant_plan)
+}
+
 pub(crate) async fn execute_semantic_plan(
     database: &Database,
     question: &str,
@@ -28,6 +97,7 @@ pub(crate) async fn execute_semantic_plan(
 ) -> Result<SemanticExecution, AgentError> {
     plan.validate()
         .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
     let compiled = compile(plan).map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
     #[cfg(debug_assertions)]
@@ -42,11 +112,12 @@ pub(crate) async fn execute_semantic_plan(
                 &plan
                     .periods
                     .iter()
-                    .map(|period| format!("{}..{}", period.start, period.end_exclusive))
+                    .map(|period| { format!("{}..{}", period.start, period.end_exclusive) })
                     .collect::<Vec<_>>()
             )
             .unwrap_or_else(|_| "[]".to_owned())
         );
+
         eprintln!(
             "[analytics query]\nrequest_id={}\nsql={}\nparams={}",
             request_id,
@@ -55,20 +126,100 @@ pub(crate) async fn execute_semantic_plan(
         );
     }
 
-    // Defense in depth: compiler output is logged, then parsed and approved by the
-    // same AST policy used for generated SQL before it can reach PostgreSQL.
+    // Defense in depth: deterministic compiler output still passes through
+    // the same read-only AST validator before reaching PostgreSQL.
     let validated = validate_sql(&compiled.sql)?;
+
     if validated.parameter_count() != compiled.parameters.len() {
         return Err(AgentError::InvalidPlan(
             "compiled query placeholder count did not match its parameters".to_owned(),
         ));
     }
+
     let mut result = database
         .execute_deterministic(&validated, &compiled.parameters)
         .await?;
+
+    let mut db_duration_ms = result.duration_ms;
+
+    /*
+     * Rust-owned automatic variant expansion.
+     *
+     * Qwen produces one product-level plan.
+     * Rust derives the variant-grain plan from that already validated plan.
+     */
+    let mut variant_execution = None;
+
+    if let Some(variant_plan) = derive_variant_expansion_plan(plan) {
+        variant_plan
+            .validate()
+            .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+        let variant_compiled =
+            compile(&variant_plan).map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "[analytics derived variant plan]\nrequest_id={}\nmetrics={:?}\ndimensions={}\nperiods={}",
+                request_id,
+                variant_plan.metrics,
+                serde_json::to_string(&variant_plan.dimensions)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                serde_json::to_string(
+                    &variant_plan
+                        .periods
+                        .iter()
+                        .map(|period| {
+                            format!(
+                                "{}..{}",
+                                period.start,
+                                period.end_exclusive
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                )
+                .unwrap_or_else(|_| "[]".to_owned())
+            );
+
+            eprintln!(
+                "[analytics derived variant query]\nrequest_id={}\nsql={}\nparams={}",
+                request_id,
+                variant_compiled.sql,
+                safe_parameters_for_log(&variant_compiled.parameters)
+            );
+        }
+
+        let variant_validated = validate_sql(&variant_compiled.sql)?;
+
+        if variant_validated.parameter_count() != variant_compiled.parameters.len() {
+            return Err(AgentError::InvalidPlan(
+                "compiled variant query placeholder count did not match its parameters".to_owned(),
+            ));
+        }
+
+        let variant_result = database
+            .execute_deterministic(&variant_validated, &variant_compiled.parameters)
+            .await?;
+
+        db_duration_ms += variant_result.duration_ms;
+
+        /*
+         * Avoid redundant nesting when only one qualifying variant
+         * is represented in the requested period.
+         */
+        if variant_result.row_count > 1 {
+            variant_execution = Some((variant_plan, variant_compiled, variant_result));
+        }
+    }
+
     let calculation_started = Instant::now();
 
     apply_period_labels(&mut result, &compiled);
+
+    if let Some((_, variant_compiled, variant_result)) = variant_execution.as_mut() {
+        apply_period_labels(variant_result, variant_compiled);
+    }
 
     let (partial_start_bucket, partial_end_bucket) = partial_bucket_edges(plan);
 
@@ -80,20 +231,20 @@ pub(crate) async fn execute_semantic_plan(
     #[cfg(debug_assertions)]
     if let Some(facts) = analytical_facts.as_ref() {
         eprintln!(
-        "[analytics facts]\nrequest_id={}\npartial_start_bucket={}\npartial_end_bucket={}\ncomplete_bucket_count={}",
-        request_id,
-        facts.partial_start_bucket,
-        facts.partial_end_bucket,
-        facts.complete_bucket_count
-    );
+            "[analytics facts]\nrequest_id={}\npartial_start_bucket={}\npartial_end_bucket={}\ncomplete_bucket_count={}",
+            request_id,
+            facts.partial_start_bucket,
+            facts.partial_end_bucket,
+            facts.complete_bucket_count
+        );
     }
 
     let summary_started = Instant::now();
 
     let answer = summarize_metric_query_with_facts(plan, &result, analytical_facts.as_ref());
 
-    let summary_duration_ms = summary_started.elapsed().as_millis();
     let chart_type = chart_type(plan);
+
     let mut response = AgentResponse::from_query(
         answer,
         question,
@@ -103,17 +254,76 @@ pub(crate) async fn execute_semantic_plan(
         chart_type,
         Some(chart_title(plan).to_owned()),
     );
+
+    let mut expanded_rows = 0usize;
+
+    if let Some((variant_plan, variant_compiled, variant_result)) = variant_execution {
+        let variant_answer =
+            summarize_metric_query_with_facts(&variant_plan, &variant_result, None);
+
+        /*
+         * Reuse the existing response/table presentation pipeline instead
+         * of creating a second frontend-specific result shape.
+         */
+        let variant_response = AgentResponse::from_query(
+            variant_answer.clone(),
+            question,
+            semantic_intent(&variant_plan),
+            variant_compiled.expected_shape,
+            &variant_result,
+            None,
+            None,
+        );
+
+        if let Some(primary_table) = response.tables.first_mut() {
+            primary_table.id = "product-performance".to_owned();
+
+            primary_table.title = "Product performance".to_owned();
+        }
+
+        if let Some(mut variant_table) = variant_response.tables.into_iter().next() {
+            variant_table.id = "variant-performance".to_owned();
+
+            variant_table.title = "Variant performance".to_owned();
+
+            response.tables.push(variant_table);
+        }
+
+        response.warnings.extend(variant_response.warnings);
+
+        if !variant_answer.trim().is_empty() {
+            response.answer.push_str("\n\nVariant breakdown: ");
+
+            response.answer.push_str(variant_answer.trim());
+        }
+
+        expanded_rows = variant_result.row_count;
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[analytics variant expansion]\nrequest_id={}\nvariant_rows={}",
+            request_id, variant_result.row_count
+        );
+    }
+
     if let Some(message) = partial_bucket_warning(plan, partial_start_bucket, partial_end_bucket) {
         response.warnings.push(WarningBlock { message });
     }
+
+    let summary_duration_ms = summary_started.elapsed().as_millis();
+
     #[cfg(debug_assertions)]
     eprintln!(
-        "[analytics summary]\nrequest_id={}\nmode=deterministic\nmetrics={:?}\nrows={}",
-        request_id, plan.metrics, result.row_count
+        "[analytics summary]\nrequest_id={}\nmode=deterministic\nmetrics={:?}\nrows={}\nvariant_rows={}",
+        request_id,
+        plan.metrics,
+        result.row_count,
+        expanded_rows
     );
+
     Ok(SemanticExecution {
-        rows: result.row_count,
-        db_duration_ms: result.duration_ms,
+        rows: result.row_count + expanded_rows,
+        db_duration_ms,
         calculation_duration_ms,
         summary_duration_ms,
         response,
@@ -341,5 +551,70 @@ mod tests {
         };
 
         assert_eq!(partial_bucket_edges(&plan), (true, true));
+    }
+    #[test]
+    fn named_product_multi_metric_snapshot_derives_variant_plan() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                exclude_cancelled: true,
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: None,
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let variant =
+            derive_variant_expansion_plan(&plan).expect("named product performance should expand");
+
+        assert_eq!(variant.metrics, plan.metrics);
+
+        assert_eq!(variant.dimensions, vec![Dimension::Variant]);
+
+        assert_eq!(variant.filters.product.as_deref(), Some("MP Sharbati Atta"));
+
+        assert_eq!(variant.sort, Some(SortSpec::Descending));
+
+        assert_eq!(variant.limit, None);
+
+        assert_eq!(variant.visualization, Some(VisualizationIntent::Table));
+
+        assert!(variant.validate().is_ok());
+    }
+    #[test]
+    fn explicit_variant_plan_is_not_auto_expanded_again() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![Metric::QuantitySold, Metric::ProductOrderCount],
+            dimensions: vec![Dimension::Variant],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        assert!(derive_variant_expansion_plan(&plan).is_none());
     }
 }
