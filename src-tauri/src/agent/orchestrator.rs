@@ -1353,6 +1353,7 @@ fn normalize_semantic_route(route: &mut SemanticPlannerResponse) {
     normalize_contiguous_time_series_periods(plan);
     normalize_redundant_single_period_dimension(plan);
     normalize_cancellation_metric_filters(plan);
+    normalize_overlapping_period_partitions(plan);
 }
 
 fn normalize_simple_unique_customer_count(route: &mut SemanticPlannerResponse) {

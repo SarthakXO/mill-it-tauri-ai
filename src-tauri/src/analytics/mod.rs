@@ -2,6 +2,7 @@ mod compiler;
 mod customers;
 mod dates;
 mod entities;
+mod facts;
 mod forecast_store;
 mod forecasting;
 mod insights;
