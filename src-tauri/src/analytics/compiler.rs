@@ -166,10 +166,11 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
     }
     if variant_dimension {
         select.extend([
-            "li.variant_id".to_owned(),
-            "COALESCE(MAX(NULLIF(li.title, '')), li.variant_id) AS historical_product_label"
-                .to_owned(),
-        ]);
+        "li.variant_id".to_owned(),
+        "COALESCE(MAX(NULLIF(pv.title, '')), MAX(NULLIF(li.title, '')), li.variant_id) AS variant_title"
+            .to_owned(),
+    ]);
+
         group.push("li.variant_id".to_owned());
     } else if product_dimension {
         select.extend([

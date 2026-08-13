@@ -16,8 +16,13 @@ pub(crate) fn summarize_metric_query(plan: &AnalyticsPlan, result: &QueryResult)
     if plan.dimensions.contains(&Dimension::Variant)
         || plan.dimensions.contains(&Dimension::Product)
     {
-        return ranking_summary(plan, result);
+        return if plan.metrics.len() > 1 {
+            multi_metric_ranking_summary(plan, result)
+        } else {
+            ranking_summary(plan, result)
+        };
     }
+
     if plan.metrics.len() > 1 {
         return multi_metric_summary(plan, result);
     }
@@ -437,6 +442,78 @@ fn multi_metric_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
     )
 }
 
+fn ranking_item_label(plan: &AnalyticsPlan, row: &serde_json::Map<String, Value>) -> String {
+    let value = if plan.dimensions.contains(&Dimension::Product) {
+        row.get("product_name")
+            .or_else(|| row.get("historical_product_label"))
+    } else {
+        row.get("variant_title")
+            .or_else(|| row.get("historical_product_label"))
+            .or_else(|| row.get("variant_name"))
+            .or_else(|| row.get("product_name"))
+    };
+
+    value
+        .and_then(Value::as_str)
+        .unwrap_or("Unnamed item")
+        .to_owned()
+}
+
+fn multi_metric_ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
+    let mut periods = Vec::<(String, Vec<&serde_json::Map<String, Value>>)>::new();
+
+    for row in &result.rows {
+        let period = row
+            .get("period")
+            .and_then(Value::as_str)
+            .or_else(|| plan.periods.first().map(|period| period.label.as_str()))
+            .unwrap_or("Requested period")
+            .to_owned();
+
+        if let Some(existing) = periods.iter_mut().find(|entry| entry.0 == period) {
+            existing.1.push(row);
+        } else {
+            periods.push((period, vec![row]));
+        }
+    }
+
+    periods
+        .into_iter()
+        .filter_map(|(period, rows)| {
+            let leaders = plan
+                .metrics
+                .iter()
+                .filter_map(|metric| {
+                    let key = metric.value_key();
+
+                    let (row, value) = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let value = row.get(key)?.as_f64()?;
+
+                            Some((*row, value))
+                        })
+                        .max_by(|left, right| left.1.total_cmp(&right.1))?;
+
+                    Some(format!(
+                        "{} leads {} with {}",
+                        ranking_item_label(plan, row),
+                        metric_label(*metric),
+                        format_value(*metric, value)
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            if leaders.is_empty() {
+                None
+            } else {
+                Some(format!("For {period}, {}.", leaders.join("; ")))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
     let metric = plan.metrics[0];
     let key = metric.value_key();
@@ -451,17 +528,7 @@ fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
             .unwrap_or("Requested period")
             .to_owned();
 
-        let item = if plan.dimensions.contains(&Dimension::Product) {
-            row.get("product_name")
-                .or_else(|| row.get("historical_product_label"))
-        } else {
-            row.get("historical_product_label")
-                .or_else(|| row.get("variant_name"))
-                .or_else(|| row.get("product_name"))
-        }
-        .and_then(Value::as_str)
-        .unwrap_or("Unnamed item")
-        .to_owned();
+        let item = ranking_item_label(plan, row);
 
         let value = row.get(key).and_then(Value::as_f64).unwrap_or(0.0);
 
@@ -680,8 +747,10 @@ fn row_label(row: &serde_json::Map<String, Value>) -> Option<String> {
         "day",
         "week",
         "month",
+        "variant_title",
         "variant_name",
         "product_name",
+        "historical_product_label",
         "operational_status",
         "order_status",
         "fulfillment_status",
@@ -960,5 +1029,94 @@ mod tests {
             }),
             ""
         );
+    }
+    #[test]
+    fn multi_metric_variant_ranking_reports_each_metric_independently() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Variant],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let mut regular = Map::new();
+
+        regular.insert("variant_id".to_owned(), Value::from("variant_regular"));
+
+        regular.insert(
+            "variant_title".to_owned(),
+            Value::from("Sharbati Regular - 5 kg"),
+        );
+
+        regular.insert("quantity_sold".to_owned(), Value::from(100));
+
+        regular.insert("product_order_count".to_owned(), Value::from(50));
+
+        regular.insert("product_unique_customers".to_owned(), Value::from(40));
+
+        regular.insert("product_sales_value".to_owned(), Value::from(10_000.0));
+
+        let mut fine = Map::new();
+
+        fine.insert("variant_id".to_owned(), Value::from("variant_fine"));
+
+        fine.insert(
+            "variant_title".to_owned(),
+            Value::from("Sharbati Fine - 5 kg"),
+        );
+
+        fine.insert("quantity_sold".to_owned(), Value::from(80));
+
+        fine.insert("product_order_count".to_owned(), Value::from(60));
+
+        fine.insert("product_unique_customers".to_owned(), Value::from(45));
+
+        fine.insert("product_sales_value".to_owned(), Value::from(12_000.0));
+
+        let result = QueryResult {
+            columns: vec![
+                "variant_id".to_owned(),
+                "variant_title".to_owned(),
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![regular, fine],
+            row_count: 2,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let summary = summarize_metric_query(&plan, &result);
+
+        assert!(summary.contains("Sharbati Regular - 5 kg leads quantity sold with 100"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads product orders with 60"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads unique product buyers with 45"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads product sales value with ₹12,000.00"));
+
+        // Product-order and buyer counts are non-additive.
+        assert!(!summary.contains("top 3 total"));
+        assert!(!summary.contains("top 5 total"));
     }
 }

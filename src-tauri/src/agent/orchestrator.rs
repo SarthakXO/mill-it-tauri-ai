@@ -511,9 +511,16 @@ impl<'a> AgentOrchestrator<'a> {
         let mut feedback = initial_feedback.map(str::to_owned);
         let mut invalid_plan = Value::Null;
 
-        // Once a typed route fails validation, the correction attempt must repair
-        // that same route rather than escaping to generated SQL or another route.
+        // Once a typed route fails validation, correction must stay on that route.
         let mut correction_route = None::<SemanticPlannerRoute>;
+
+        // Preserve the normalized first plan so correction cannot silently rewrite
+        // unrelated analytical semantics.
+        let mut correction_plan = None::<AnalyticsPlan>;
+
+        // Preserve the exact validation failure so Rust knows which field the
+        // correction attempt is permitted to repair.
+        let mut correction_error = None::<String>;
 
         for attempt in 0..2 {
             let payload = json!({
@@ -530,7 +537,19 @@ impl<'a> AgentOrchestrator<'a> {
                     "required_route": correction_route
                         .as_ref()
                         .map(|route| format!("{route:?}")),
-                    "instruction": "Correct only the typed plan for the current request. Stay on the same route as the rejected plan. Do not produce SQL and do not switch to generated_sql."
+                    "instruction": concat!(
+                        "Treat invalid_plan as the baseline plan to patch. ",
+                        "Make only the minimum field changes required to resolve safe_validation_error. ",
+                        "Preserve every field that is not directly implicated by safe_validation_error, ",
+                        "including domain, metrics, dimensions, periods, sort, limit, visualization, ",
+                        "and unrelated filters. ",
+                        "Never drop, add, reorder, or substitute an explicitly requested metric unless ",
+                        "safe_validation_error specifically identifies the metric set as invalid. ",
+                        "Preserve every explicit user constraint. ",
+                        "Stay on the same typed route specified by required_route. ",
+                        "Do not reinterpret the analytical request from scratch. ",
+                        "Do not produce SQL and do not switch to generated_sql."
+                    )
                 }))
             });
 
@@ -556,16 +575,16 @@ impl<'a> AgentOrchestrator<'a> {
 
                     normalize_semantic_route(&mut route);
 
-                    // Correction attempts are route-sticky. A malformed typed plan
-                    // must be repaired as the same typed route rather than escaping
-                    // into generated SQL or another execution path.
+                    /*
+                     * Correction attempts are route-sticky.
+                     */
                     if let Some(expected_route) = correction_route.as_ref() {
                         if &route.route != expected_route {
                             let error = format!(
-                            "semantic planner correction changed route from {:?} to {:?}; corrections must remain on the original route",
-                            expected_route,
-                            route.route
-                        );
+                                "semantic planner correction changed route from {:?} to {:?}; \
+                             corrections must remain on the original route",
+                                expected_route, route.route
+                            );
 
                             #[cfg(debug_assertions)]
                             eprintln!(
@@ -577,6 +596,21 @@ impl<'a> AgentOrchestrator<'a> {
 
                             return Err(AgentError::InvalidPlan(error));
                         }
+                    }
+
+                    /*
+                     * Apply deterministic correction-field ownership.
+                     *
+                     * For known validation failures Rust preserves the already-good
+                     * baseline plan and accepts only the field that Qwen was asked
+                     * to repair.
+                     */
+                    if attempt > 0 {
+                        apply_semantic_correction_baseline(
+                            &mut route,
+                            correction_plan.as_ref(),
+                            correction_error.as_deref(),
+                        );
                     }
 
                     let validation = validate_semantic_route(&route)
@@ -598,6 +632,14 @@ impl<'a> AgentOrchestrator<'a> {
 
                         Err(error) if attempt == 0 => {
                             correction_route = Some(route.route.clone());
+
+                            /*
+                             * Store the normalized analytics plan as the correction
+                             * baseline before asking Qwen to repair it.
+                             */
+                            correction_plan = route.plan.clone();
+
+                            correction_error = Some(error.clone());
 
                             invalid_plan = route
                                 .plan
@@ -653,8 +695,10 @@ impl<'a> AgentOrchestrator<'a> {
                     eprintln!("[invalid semantic planner response]\n{}", response);
 
                     feedback = Some(format!(
-                    "semantic planner JSON was invalid: {error}. Return exactly one JSON object matching the supplied schema with no trailing content."
-                ));
+                        "semantic planner JSON was invalid: {error}. \
+                     Return exactly one JSON object matching the supplied schema \
+                     with no trailing content."
+                    ));
                 }
 
                 Err(error) => {
@@ -1697,39 +1741,94 @@ fn normalize_redundant_single_period_dimension(plan: &mut AnalyticsPlan) {
         .retain(|dimension| *dimension != Dimension::Period);
 }
 
+const NAMED_PRODUCT_VARIANT_FILTER_ERROR: &str =
+    "the request asks for a variant breakdown of a named parent product; \
+     preserve that parent product in filters.product while keeping dimension=variant";
+
 fn validate_semantic_route_for_question(
     route: &SemanticPlannerResponse,
     question: &str,
 ) -> Result<(), String> {
+    use crate::analytics::Dimension;
+
     let normalized = question.to_lowercase();
+
     if normalized.contains("monthly") || normalized.contains("every month") {
         if let Some(plan) = route.plan.as_ref() {
-            if !plan
-                .dimensions
-                .contains(&crate::analytics::Dimension::Month)
-            {
+            if !plan.dimensions.contains(&Dimension::Month) {
                 return Err("the request explicitly requires monthly grain; \
-                 use dimension=month with one continuous TimePeriod \
-                 covering the requested date range"
+                     use dimension=month with one continuous TimePeriod \
+                     covering the requested date range"
                     .to_owned());
             }
         }
     }
+
+    /*
+    * Explicit named-product variant breakdown.
+    *
+    * Rust does not resolve or extract the product name here.
+    * It only enforces preservation of the product constraint that
+    * Qwen is responsible for interpreting into filters.product.
+
+    */
+
+    if normalized.contains("by variant for ") {
+        if let Some(plan) = route.plan.as_ref() {
+            if plan.dimensions.contains(&Dimension::Variant) && plan.filters.product.is_none() {
+                return Err(NAMED_PRODUCT_VARIANT_FILTER_ERROR.to_owned());
+            }
+        }
+    }
+
     if requires_deep_analysis(question) && route.analysis_depth != AnalysisDepth::Deep {
         return Err("explicit analysis intent requires analysis_depth=deep".to_owned());
     }
+
     if route.plan.as_ref().is_some_and(|plan| {
         plan.metrics
             .contains(&crate::analytics::Metric::AverageItemQuantityPerOrder)
     }) && normalized.contains("line item")
         && !normalized.contains("quantity")
     {
-        return Err(
-            "line-item row count is not average item quantity; route this request to generated_sql"
-                .to_owned(),
-        );
+        return Err("line-item row count is not average item quantity; \
+             route this request to generated_sql"
+            .to_owned());
     }
+
     Ok(())
+}
+
+fn apply_semantic_correction_baseline(
+    route: &mut SemanticPlannerResponse,
+    baseline_plan: Option<&AnalyticsPlan>,
+    validation_error: Option<&str>,
+) {
+    if validation_error != Some(NAMED_PRODUCT_VARIANT_FILTER_ERROR) {
+        return;
+    }
+
+    let Some(baseline_plan) = baseline_plan else {
+        return;
+    };
+
+    let Some(corrected_plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    /*
+     * For this validation failure, the only field Qwen is allowed to repair
+     * is filters.product.
+     *
+     * The first rejected plan was otherwise already normalized and valid for
+     * the requested metrics, dimensions, periods, population, and output
+     * shape. Preserve that baseline deterministically.
+     */
+    let corrected_product = corrected_plan.filters.product.clone();
+
+    *corrected_plan = baseline_plan.clone();
+
+    corrected_plan.filters.product = corrected_product;
 }
 
 #[derive(Debug, Deserialize)]
@@ -4692,5 +4791,90 @@ mod tests {
 
         assert!(plan.metrics.contains(&Metric::ProductSalesValue));
         assert!(plan.metrics.contains(&Metric::CancelledOrderCount));
+    }
+    #[test]
+    fn named_product_variant_breakdown_requires_product_filter() {
+        let route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![Dimension::Variant],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    exclude_cancelled: true,
+                    ..AnalyticsFilters::default()
+                },
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        let error = validate_semantic_route_for_question(
+        &route,
+        "Show quantity sold, product orders, unique buyers, and product sales value by variant for MP Sharbati Atta in July 2026.",
+    )
+    .expect_err("named product variant breakdown must preserve product filter");
+
+        assert!(error.contains("filters.product"));
+    }
+    #[test]
+    fn named_product_variant_breakdown_accepts_product_filter() {
+        let route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![Dimension::Variant],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    exclude_cancelled: true,
+                    product: Some("MP Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: Some(SortSpec::Descending),
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        assert!(
+        validate_semantic_route_for_question(
+            &route,
+            "Show quantity sold, product orders, unique buyers, and product sales value by variant for MP Sharbati Atta in July 2026.",
+        )
+        .is_ok()
+    );
     }
 }
