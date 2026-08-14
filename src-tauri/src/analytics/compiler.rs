@@ -16,15 +16,92 @@ pub(crate) struct CompiledAnalyticsQuery {
 }
 
 pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, CompileError> {
-    compile_with_product_id(plan, None)
+    compile_with_product_selection(plan, None, &[])
 }
 
 pub(crate) fn compile_with_product_id(
     plan: &AnalyticsPlan,
     resolved_product_id: Option<&str>,
 ) -> Result<CompiledAnalyticsQuery, CompileError> {
+    compile_with_product_selection(plan, resolved_product_id, &[])
+}
+
+pub(crate) fn compile_with_product_ids(
+    plan: &AnalyticsPlan,
+    resolved_product_ids: &[&str],
+) -> Result<CompiledAnalyticsQuery, CompileError> {
+    compile_with_product_selection(plan, None, resolved_product_ids)
+}
+
+fn compile_with_product_selection(
+    plan: &AnalyticsPlan,
+    resolved_product_id: Option<&str>,
+    resolved_product_ids: &[&str],
+) -> Result<CompiledAnalyticsQuery, CompileError> {
     plan.validate()
         .map_err(|error| CompileError(error.to_string()))?;
+    let has_multi_product_filter = !plan.filters.products.is_empty();
+
+    if has_multi_product_filter {
+        /*
+         * B5 product mentions must be resolved before compilation.
+         *
+         * Never allow a validated multi-product plan to fall through into
+         * an unrestricted catalogue query.
+         */
+        if resolved_product_id.is_some() {
+            return Err(CompileError(
+                "multi-product comparison cannot use a single resolved product id".to_owned(),
+            ));
+        }
+
+        if resolved_product_ids.len() != plan.filters.products.len() {
+            return Err(CompileError(
+            "multi-product comparison requires one resolved product id for every requested product"
+                .to_owned(),
+        ));
+        }
+
+        if resolved_product_ids
+            .iter()
+            .any(|product_id| product_id.trim().is_empty())
+        {
+            return Err(CompileError(
+                "resolved product ids cannot be empty".to_owned(),
+            ));
+        }
+
+        let mut unique_product_ids = resolved_product_ids
+            .iter()
+            .map(|product_id| product_id.trim())
+            .collect::<Vec<_>>();
+
+        unique_product_ids.sort_unstable();
+        unique_product_ids.dedup();
+
+        if unique_product_ids.len() != resolved_product_ids.len() {
+            return Err(CompileError(
+                "multi-product comparison resolved multiple mentions to the same product"
+                    .to_owned(),
+            ));
+        }
+
+        /*
+         * Explicit product comparisons must return the complete requested
+         * comparison set. A ranking limit could silently remove one of the
+         * requested products.
+         */
+        if plan.limit.is_some() {
+            return Err(CompileError(
+                "explicit multi-product comparisons cannot use a result limit".to_owned(),
+            ));
+        }
+    } else if !resolved_product_ids.is_empty() {
+        return Err(CompileError(
+            "resolved product id list was supplied without a multi-product filter".to_owned(),
+        ));
+    }
+
     let mut parameters = period_parameters(plan);
     let period_case = period_case(plan);
     let range_filter = range_filter(plan);
@@ -58,6 +135,7 @@ pub(crate) fn compile_with_product_id(
     let catalogue_scoped_product_query = product_dimension
         || variant_dimension
         || resolved_product_id.is_some()
+        || !resolved_product_ids.is_empty()
         || plan.filters.product.is_some()
         || plan.filters.variant_id.is_some();
 
@@ -134,15 +212,40 @@ pub(crate) fn compile_with_product_id(
         "o.store_id =",
     );
     if let Some(product_id) = resolved_product_id {
+        /*
+         * Existing exact single-product path.
+         */
         parameters.push(QueryParameter::String(product_id.to_owned()));
 
         where_parts.push(format!("p.id = (${}::text)", parameters.len()));
+    } else if !resolved_product_ids.is_empty() {
+        /*
+         * B5 exact multi-product path.
+         *
+         * Every value came from the Rust catalogue resolver.
+         * Product IDs remain parameters; they are never interpolated into
+         * SQL text.
+         */
+        let placeholders = resolved_product_ids
+            .iter()
+            .map(|product_id| {
+                parameters.push(QueryParameter::String((*product_id).to_owned()));
+
+                format!("(${}::text)", parameters.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        where_parts.push(format!("p.id IN ({placeholders})"));
     } else if let Some(product) = plan.filters.product.as_deref() {
         /*
-         * Legacy/direct compiler fallback.
+         * Legacy/direct single-product compiler fallback.
          *
          * Normal semantic execution resolves product mentions before
          * compilation and therefore uses exact product identity above.
+         *
+         * There is deliberately NO equivalent fuzzy fallback for
+         * `filters.products`.
          */
         parameters.push(QueryParameter::String(product.to_owned()));
 
@@ -512,6 +615,38 @@ mod tests {
             visualization: Some(VisualizationIntent::Bar),
         }
     }
+    fn multi_product_plan() -> AnalyticsPlan {
+        AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Product],
+            periods: vec![period("July 2026", 2026, 7)],
+            filters: AnalyticsFilters {
+                exclude_cancelled: true,
+                products: vec!["Sharbati Atta".to_owned(), "Khapli Emmer".to_owned()],
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        }
+    }
+    #[test]
+    fn multi_product_plan_requires_resolved_product_ids() {
+        let plan = multi_product_plan();
+
+        let error = compile(&plan)
+            .expect_err("multi-product plan must not compile without exact resolved product ids");
+
+        assert!(error
+            .to_string()
+            .contains("one resolved product id for every requested product"));
+    }
 
     #[test]
     fn four_period_order_plan_compiles_to_one_valid_parameterized_select() {
@@ -857,5 +992,160 @@ mod tests {
             Some(QueryParameter::String(value))
                 if value == "prod_sharbati"
         ));
+    }
+    #[test]
+    fn multi_product_compile_uses_exact_parameterized_product_ids() {
+        let plan = multi_product_plan();
+
+        let product_ids = ["prod_sharbati", "prod_khapli"];
+
+        let compiled = compile_with_product_ids(&plan, &product_ids)
+            .expect("resolved multi-product comparison should compile");
+
+        let validated =
+            validate_sql(&compiled.sql).expect("multi-product compiler SQL must pass AST safety");
+
+        assert_eq!(validated.parameter_count(), 4);
+
+        assert_eq!(compiled.parameters.len(), 4);
+
+        assert!(
+            compiled.sql.contains("p.id IN (($3::text), ($4::text))"),
+            "unexpected SQL: {}",
+            compiled.sql
+        );
+
+        assert!(
+            !compiled.sql.contains("lower(li.title) LIKE"),
+            "multi-product comparison must not use fuzzy title filtering"
+        );
+
+        assert!(
+            !compiled.sql.contains("Sharbati Atta"),
+            "user product mention leaked into SQL"
+        );
+
+        assert!(
+            !compiled.sql.contains("Khapli Emmer"),
+            "user product mention leaked into SQL"
+        );
+
+        assert!(matches!(
+            &compiled.parameters[2],
+            QueryParameter::String(value)
+                if value == "prod_sharbati"
+        ));
+
+        assert!(matches!(
+            &compiled.parameters[3],
+            QueryParameter::String(value)
+                if value == "prod_khapli"
+        ));
+    }
+    #[test]
+    fn multi_product_compile_remains_product_grain() {
+        let plan = multi_product_plan();
+
+        let product_ids = ["prod_sharbati", "prod_khapli"];
+
+        let compiled = compile_with_product_ids(&plan, &product_ids).unwrap();
+
+        validate_sql(&compiled.sql).expect("multi-product SQL must pass AST safety");
+
+        assert!(compiled.sql.contains("pv.product_id AS product_id"));
+
+        assert!(compiled.sql.contains("COALESCE(MAX(NULLIF(p.title, ''))"));
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.id) AS product_order_count"));
+
+        assert!(compiled
+            .sql
+            .contains("COUNT(DISTINCT o.customer_id) AS product_unique_customers"));
+
+        let (_, grouping_tail) = compiled
+            .sql
+            .rsplit_once(" GROUP BY ")
+            .expect("multi-product comparison must group");
+
+        let grouping = grouping_tail
+            .split(" ORDER BY ")
+            .next()
+            .expect("grouping must precede ordering");
+
+        assert_eq!(grouping.trim(), "pv.product_id");
+
+        assert!(!grouping.contains("li.variant_id"));
+
+        assert!(!grouping.contains("li.title"));
+    }
+    #[test]
+    fn multi_product_compile_rejects_missing_resolved_product_id() {
+        let plan = multi_product_plan();
+
+        let product_ids = ["prod_sharbati"];
+
+        assert!(compile_with_product_ids(&plan, &product_ids,).is_err());
+    }
+    #[test]
+    fn multi_product_compile_rejects_duplicate_resolved_product_ids() {
+        let plan = multi_product_plan();
+
+        let product_ids = ["prod_sharbati", "prod_sharbati"];
+
+        assert!(compile_with_product_ids(&plan, &product_ids,).is_err());
+    }
+    #[test]
+    fn multi_product_compile_rejects_result_limit() {
+        let mut plan = multi_product_plan();
+
+        plan.limit = Some(1);
+
+        let product_ids = ["prod_sharbati", "prod_khapli"];
+
+        assert!(compile_with_product_ids(&plan, &product_ids,).is_err());
+    }
+    #[test]
+    fn monthly_multi_product_comparison_groups_by_month_and_product() {
+        let mut plan = multi_product_plan();
+
+        plan.dimensions = vec![Dimension::Month, Dimension::Product];
+
+        plan.periods = vec![TimePeriod {
+            label: "May through July 2026".to_owned(),
+            start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        }];
+
+        plan.sort = Some(SortSpec::Chronological);
+
+        let product_ids = ["prod_sharbati", "prod_khapli"];
+
+        let compiled = compile_with_product_ids(&plan, &product_ids).unwrap();
+
+        validate_sql(&compiled.sql).expect("monthly multi-product SQL must pass AST safety");
+
+        assert!(compiled.sql.contains("date_trunc('month'"));
+
+        assert!(compiled.sql.contains("p.id IN (($3::text), ($4::text))"));
+
+        assert!(
+            compiled.sql.contains("GROUP BY month, pv.product_id"),
+            "unexpected SQL: {}",
+            compiled.sql
+        );
+
+        assert!(compiled.sql.contains("ORDER BY month"));
+
+        assert!(
+            !compiled.sql.contains("li.variant_id")
+                || !compiled
+                    .sql
+                    .split(" GROUP BY ")
+                    .last()
+                    .unwrap_or_default()
+                    .contains("li.variant_id")
+        );
     }
 }

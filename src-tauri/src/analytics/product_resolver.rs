@@ -39,26 +39,78 @@ pub(crate) struct ProductResolutionLookup {
     pub(crate) db_duration_ms: u128,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedProductMention {
+    pub(crate) mention: String,
+    pub(crate) product: ResolvedProduct,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MultiProductResolution {
+    Resolved(Vec<ResolvedProductMention>),
+
+    Ambiguous {
+        mention: String,
+        candidates: Vec<ResolvedProduct>,
+    },
+
+    NotFound {
+        mention: String,
+    },
+
+    DuplicateResolvedProduct {
+        first_mention: String,
+        duplicate_mention: String,
+        product: ResolvedProduct,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MultiProductResolutionLookup {
+    pub(crate) resolution: MultiProductResolution,
+    pub(crate) db_duration_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+struct CatalogueProduct {
+    product_id: String,
+    product_name: String,
+}
+
 pub(crate) async fn resolve_product(
     database: &Database,
     mention: &str,
 ) -> Result<ProductResolutionLookup, AgentError> {
-    let normalized_mention = normalize_text(mention);
+    let (catalogue, db_duration_ms) = load_product_catalogue(database).await?;
 
-    if normalized_mention.is_empty() {
-        return Ok(ProductResolutionLookup {
-            resolution: ProductResolution::NotFound,
-            db_duration_ms: 0,
-        });
-    }
+    Ok(ProductResolutionLookup {
+        resolution: resolve_product_from_catalogue(mention, &catalogue),
+        db_duration_ms,
+    })
+}
 
+pub(crate) async fn resolve_products(
+    database: &Database,
+    mentions: &[String],
+) -> Result<MultiProductResolutionLookup, AgentError> {
+    let (catalogue, db_duration_ms) = load_product_catalogue(database).await?;
+
+    Ok(MultiProductResolutionLookup {
+        resolution: resolve_products_from_catalogue(mentions, &catalogue),
+        db_duration_ms,
+    })
+}
+
+async fn load_product_catalogue(
+    database: &Database,
+) -> Result<(Vec<CatalogueProduct>, u128), AgentError> {
     let validated = validate_sql(PRODUCT_CATALOGUE_SQL)?;
 
     let result = database.execute_deterministic(&validated, &[]).await?;
 
     let db_duration_ms = result.duration_ms;
 
-    let mut candidates = result
+    let catalogue = result
         .rows
         .iter()
         .filter_map(|row| {
@@ -70,11 +122,88 @@ pub(crate) async fn resolve_product(
                 return None;
             }
 
-            Some(ResolvedProduct {
+            Some(CatalogueProduct {
                 product_id: product_id.to_owned(),
                 product_name: product_name.to_owned(),
-                score: product_match_score(&normalized_mention, product_name),
             })
+        })
+        .collect::<Vec<_>>();
+
+    Ok((catalogue, db_duration_ms))
+}
+
+fn resolve_products_from_catalogue(
+    mentions: &[String],
+    catalogue: &[CatalogueProduct],
+) -> MultiProductResolution {
+    let mut resolved = Vec::<ResolvedProductMention>::with_capacity(mentions.len());
+
+    for mention in mentions {
+        match resolve_product_from_catalogue(mention, catalogue) {
+            ProductResolution::Resolved(product) => {
+                /*
+                 * Two different user mentions can still resolve to the
+                 * same canonical product.
+                 *
+                 * Example:
+                 * "Sharbati Atta"
+                 * "MP Sharbati Atta"
+                 *
+                 * B5 comparisons must contain distinct canonical
+                 * products, so do not silently compare the same product
+                 * twice.
+                 */
+                if let Some(existing) = resolved
+                    .iter()
+                    .find(|existing| existing.product.product_id == product.product_id)
+                {
+                    return MultiProductResolution::DuplicateResolvedProduct {
+                        first_mention: existing.mention.clone(),
+                        duplicate_mention: mention.clone(),
+                        product,
+                    };
+                }
+
+                resolved.push(ResolvedProductMention {
+                    mention: mention.clone(),
+                    product,
+                });
+            }
+
+            ProductResolution::Ambiguous(candidates) => {
+                return MultiProductResolution::Ambiguous {
+                    mention: mention.clone(),
+                    candidates,
+                };
+            }
+
+            ProductResolution::NotFound => {
+                return MultiProductResolution::NotFound {
+                    mention: mention.clone(),
+                };
+            }
+        }
+    }
+
+    MultiProductResolution::Resolved(resolved)
+}
+
+fn resolve_product_from_catalogue(
+    mention: &str,
+    catalogue: &[CatalogueProduct],
+) -> ProductResolution {
+    let normalized_mention = normalize_text(mention);
+
+    if normalized_mention.is_empty() {
+        return ProductResolution::NotFound;
+    }
+
+    let mut candidates = catalogue
+        .iter()
+        .map(|product| ResolvedProduct {
+            product_id: product.product_id.clone(),
+            product_name: product.product_name.clone(),
+            score: product_match_score(&normalized_mention, &product.product_name),
         })
         .filter(|candidate| candidate.score >= MIN_PRODUCT_MATCH_SCORE)
         .collect::<Vec<_>>();
@@ -88,10 +217,7 @@ pub(crate) async fn resolve_product(
     });
 
     let Some(best) = candidates.first().cloned() else {
-        return Ok(ProductResolutionLookup {
-            resolution: ProductResolution::NotFound,
-            db_duration_ms,
-        });
+        return ProductResolution::NotFound;
     };
 
     /*
@@ -99,26 +225,12 @@ pub(crate) async fn resolve_product(
      * catalogue prefix such as "MP" are authoritative.
      */
     if best.score >= 0.99 {
-        return Ok(ProductResolutionLookup {
-            resolution: ProductResolution::Resolved(best),
-            db_duration_ms,
-        });
+        return ProductResolution::Resolved(best);
     }
 
     /*
      * A single exact catalogue token is too weak to choose between
      * multiple products that share that token.
-     *
-     * Example:
-     *
-     * "sharbati"
-     *
-     * may match:
-     * - MP Sharbati Atta
-     * - Sharbati Daliya
-     *
-     * In that case asking for clarification is safer than selecting
-     * whichever title happens to be shorter.
      */
     let mention_tokens = normalized_mention.split_whitespace().collect::<Vec<_>>();
 
@@ -137,10 +249,7 @@ pub(crate) async fn resolve_product(
             .collect::<Vec<_>>();
 
         if token_matches.len() > 1 {
-            return Ok(ProductResolutionLookup {
-                resolution: ProductResolution::Ambiguous(token_matches),
-                db_duration_ms,
-            });
+            return ProductResolution::Ambiguous(token_matches);
         }
     }
 
@@ -152,16 +261,10 @@ pub(crate) async fn resolve_product(
         .collect::<Vec<_>>();
 
     if ambiguous.len() > 1 {
-        return Ok(ProductResolutionLookup {
-            resolution: ProductResolution::Ambiguous(ambiguous),
-            db_duration_ms,
-        });
+        return ProductResolution::Ambiguous(ambiguous);
     }
 
-    Ok(ProductResolutionLookup {
-        resolution: ProductResolution::Resolved(best),
-        db_duration_ms,
-    })
+    ProductResolution::Resolved(best)
 }
 
 fn product_match_score(normalized_mention: &str, product_name: &str) -> f64 {
@@ -320,6 +423,13 @@ fn levenshtein_distance(left: &[char], right: &[char]) -> usize {
 mod tests {
     use super::*;
 
+    fn catalogue_product(product_id: &str, product_name: &str) -> CatalogueProduct {
+        CatalogueProduct {
+            product_id: product_id.to_owned(),
+            product_name: product_name.to_owned(),
+        }
+    }
+
     #[test]
     fn exact_name_is_strongest_match() {
         assert_eq!(
@@ -380,5 +490,136 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(matching.len(), 2);
+    }
+    #[test]
+    fn multi_product_resolution_resolves_every_requested_product_in_order() {
+        let catalogue = vec![
+            catalogue_product("prod_sharbati", "MP Sharbati Atta"),
+            catalogue_product("prod_khapli", "Khapli/Emmer Wheat Atta"),
+            catalogue_product("prod_multigrain", "Multigrain Atta"),
+        ];
+
+        let mentions = vec![
+            "khapli emmer".to_owned(),
+            "sharbati atta".to_owned(),
+            "multigrain atta".to_owned(),
+        ];
+
+        let resolution = resolve_products_from_catalogue(&mentions, &catalogue);
+
+        let MultiProductResolution::Resolved(resolved) = resolution else {
+            panic!("expected all product mentions to resolve");
+        };
+
+        assert_eq!(resolved.len(), 3);
+
+        assert_eq!(resolved[0].mention, "khapli emmer");
+        assert_eq!(resolved[0].product.product_id, "prod_khapli");
+        assert_eq!(resolved[0].product.product_name, "Khapli/Emmer Wheat Atta");
+
+        assert_eq!(resolved[1].mention, "sharbati atta");
+        assert_eq!(resolved[1].product.product_id, "prod_sharbati");
+
+        assert_eq!(resolved[2].mention, "multigrain atta");
+        assert_eq!(resolved[2].product.product_id, "prod_multigrain");
+    }
+    #[test]
+    fn multi_product_resolution_aborts_when_one_mention_is_ambiguous() {
+        let catalogue = vec![
+            catalogue_product("prod_sharbati_atta", "MP Sharbati Atta"),
+            catalogue_product("prod_sharbati_daliya", "Sharbati Daliya"),
+            catalogue_product("prod_khapli", "Khapli/Emmer Wheat Atta"),
+        ];
+
+        let mentions = vec!["khapli emmer".to_owned(), "sharbati".to_owned()];
+
+        let resolution = resolve_products_from_catalogue(&mentions, &catalogue);
+
+        let MultiProductResolution::Ambiguous {
+            mention,
+            candidates,
+        } = resolution
+        else {
+            panic!("expected ambiguous product mention");
+        };
+
+        assert_eq!(mention, "sharbati");
+
+        assert_eq!(candidates.len(), 2);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| { candidate.product_id == "prod_sharbati_atta" }));
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| { candidate.product_id == "prod_sharbati_daliya" }));
+    }
+    #[test]
+    fn multi_product_resolution_aborts_when_one_mention_is_not_found() {
+        let catalogue = vec![
+            catalogue_product("prod_sharbati", "MP Sharbati Atta"),
+            catalogue_product("prod_khapli", "Khapli/Emmer Wheat Atta"),
+        ];
+
+        let mentions = vec![
+            "sharbati atta".to_owned(),
+            "completely nonexistent product".to_owned(),
+        ];
+
+        let resolution = resolve_products_from_catalogue(&mentions, &catalogue);
+
+        let MultiProductResolution::NotFound { mention } = resolution else {
+            panic!("expected unresolved product mention");
+        };
+
+        assert_eq!(mention, "completely nonexistent product");
+    }
+    #[test]
+    fn multi_product_resolution_rejects_two_mentions_of_same_canonical_product() {
+        let catalogue = vec![
+            catalogue_product("prod_sharbati", "MP Sharbati Atta"),
+            catalogue_product("prod_khapli", "Khapli/Emmer Wheat Atta"),
+        ];
+
+        let mentions = vec!["MP Sharbati Atta".to_owned(), "Sharbati Atta".to_owned()];
+
+        let resolution = resolve_products_from_catalogue(&mentions, &catalogue);
+
+        let MultiProductResolution::DuplicateResolvedProduct {
+            first_mention,
+            duplicate_mention,
+            product,
+        } = resolution
+        else {
+            panic!("expected duplicate canonical product");
+        };
+
+        assert_eq!(first_mention, "MP Sharbati Atta");
+
+        assert_eq!(duplicate_mention, "Sharbati Atta");
+
+        assert_eq!(product.product_id, "prod_sharbati");
+    }
+    #[test]
+    fn multi_product_resolution_uses_existing_typo_tolerance() {
+        let catalogue = vec![
+            catalogue_product("prod_sharbati", "MP Sharbati Atta"),
+            catalogue_product("prod_khapli", "Khapli/Emmer Wheat Atta"),
+        ];
+
+        let mentions = vec!["sharbti atta".to_owned(), "khapli emmer".to_owned()];
+
+        let resolution = resolve_products_from_catalogue(&mentions, &catalogue);
+
+        let MultiProductResolution::Resolved(resolved) = resolution else {
+            panic!("expected typo-tolerant resolution");
+        };
+
+        assert_eq!(resolved.len(), 2);
+
+        assert_eq!(resolved[0].product.product_id, "prod_sharbati");
+
+        assert_eq!(resolved[1].product.product_id, "prod_khapli");
     }
 }

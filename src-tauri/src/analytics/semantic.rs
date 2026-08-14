@@ -1,5 +1,5 @@
 use super::{
-    compiler::{compile_with_product_id, CompiledAnalyticsQuery},
+    compiler::{compile_with_product_id, compile_with_product_ids, CompiledAnalyticsQuery},
     facts::{
         build_temporal_variant_mix_shift_facts, build_time_series_facts,
         derive_temporal_variant_mix_shift_driver_facts, enrich_temporal_variant_contribution_facts,
@@ -10,7 +10,10 @@ use super::{
         summarize_variant_contribution_facts,
     },
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
-    product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
+    product_resolver::{
+        resolve_product, resolve_products, MultiProductResolution, ProductResolution,
+        ResolvedProduct,
+    },
 };
 use crate::{
     agent::{AgentError, AgentResponse, ChartType, WarningBlock},
@@ -165,8 +168,129 @@ pub(crate) async fn execute_semantic_plan(
         .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
     let mut resolver_db_duration_ms = 0_u128;
 
-    let resolved_product = if plan.domain == AnalyticsDomain::Products {
-        if let Some(mention) = plan.filters.product.as_deref() {
+    let mut resolved_product = None;
+
+    let mut resolved_product_ids = Vec::<String>::new();
+
+    if plan.domain == AnalyticsDomain::Products {
+        /*
+         * B5 explicit multi-product comparison.
+         *
+         * Resolve the complete comparison set in one catalogue lookup.
+         * No analytical query executes unless every mention resolves
+         * successfully to a distinct canonical product.
+         */
+        if !plan.filters.products.is_empty() {
+            let lookup = resolve_products(database, &plan.filters.products).await?;
+
+            resolver_db_duration_ms = lookup.db_duration_ms;
+
+            match lookup.resolution {
+                MultiProductResolution::Resolved(products) => {
+                    #[cfg(debug_assertions)]
+                    for resolved in &products {
+                        eprintln!(
+                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
+                        request_id,
+                        resolved.mention,
+                        resolved.product.product_id,
+                        resolved.product.product_name,
+                        resolved.product.score
+                    );
+                    }
+
+                    /*
+                     * Preserve mention order.
+                     *
+                     * compile_with_product_ids() accepts only canonical IDs;
+                     * user-entered product strings never reach the analytical
+                     * SQL filter.
+                     */
+                    resolved_product_ids = products
+                        .into_iter()
+                        .map(|resolved| resolved.product.product_id)
+                        .collect();
+                }
+
+                MultiProductResolution::Ambiguous {
+                    mention,
+                    candidates,
+                } => {
+                    let choices = candidates
+                        .iter()
+                        .map(|candidate| candidate.product_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
+                    request_id,
+                    mention,
+                    choices
+                );
+
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
+                }
+
+                MultiProductResolution::NotFound { mention } => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
+                    request_id,
+                    mention
+                );
+
+                    return Ok(SemanticExecution {
+                        response: AgentResponse::text(format!(
+                        "I couldn't confidently match \"{mention}\" to a current published product."
+                    )),
+                        rows: 0,
+                        db_duration_ms: resolver_db_duration_ms,
+                        calculation_duration_ms: 0,
+                        summary_duration_ms: 0,
+                    });
+                }
+
+                MultiProductResolution::DuplicateResolvedProduct {
+                    first_mention,
+                    duplicate_mention,
+                    product,
+                } => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nfirst_mention={:?}\nduplicate_mention={:?}\nresult=duplicate\nproduct_id={}\nproduct_name={:?}",
+                    request_id,
+                    first_mention,
+                    duplicate_mention,
+                    product.product_id,
+                    product.product_name
+                );
+
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "\"{first_mention}\" and \"{duplicate_mention}\" both match the published product \"{}\". Please compare distinct products.",
+                        product.product_name
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
+                }
+            }
+        } else if let Some(mention) = plan.filters.product.as_deref() {
+            /*
+             * Existing B3/B4 single-product path.
+             */
             let lookup = resolve_product(database, mention).await?;
 
             resolver_db_duration_ms = lookup.db_duration_ms;
@@ -175,15 +299,15 @@ pub(crate) async fn execute_semantic_plan(
                 ProductResolution::Resolved(product) => {
                     #[cfg(debug_assertions)]
                     eprintln!(
-                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
-                        request_id,
-                        mention,
-                        product.product_id,
-                        product.product_name,
-                        product.score
-                    );
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
+                    request_id,
+                    mention,
+                    product.product_id,
+                    product.product_name,
+                    product.score
+                );
 
-                    Some(product)
+                    resolved_product = Some(product);
                 }
 
                 ProductResolution::Ambiguous(candidates) => {
@@ -195,67 +319,69 @@ pub(crate) async fn execute_semantic_plan(
 
                     #[cfg(debug_assertions)]
                     eprintln!(
-                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
-                        request_id,
-                        mention,
-                        choices
-                    );
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
+                    request_id,
+                    mention,
+                    choices
+                );
 
-                    return Ok(
-                        SemanticExecution {
-                            response:
-                                AgentResponse::text(
-                                    format!(
-                                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
-                                    ),
-                                ),
-                            rows: 0,
-                            db_duration_ms:
-                                resolver_db_duration_ms,
-                            calculation_duration_ms: 0,
-                            summary_duration_ms: 0,
-                        },
-                    );
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
                 }
 
                 ProductResolution::NotFound => {
                     #[cfg(debug_assertions)]
                     eprintln!(
-                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
-                        request_id,
-                        mention
-                    );
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
+                    request_id,
+                    mention
+                );
 
-                    return Ok(
-                        SemanticExecution {
-                            response:
-                                AgentResponse::text(
-                                    format!(
-                                        "I couldn't confidently match \"{mention}\" to a current published product."
-                                    ),
-                                ),
-                            rows: 0,
-                            db_duration_ms:
-                                resolver_db_duration_ms,
-                            calculation_duration_ms: 0,
-                            summary_duration_ms: 0,
-                        },
-                    );
+                    return Ok(SemanticExecution {
+                        response: AgentResponse::text(format!(
+                        "I couldn't confidently match \"{mention}\" to a current published product."
+                    )),
+                        rows: 0,
+                        db_duration_ms: resolver_db_duration_ms,
+                        calculation_duration_ms: 0,
+                        summary_duration_ms: 0,
+                    });
                 }
             }
-        } else {
-            None
         }
-    } else {
-        None
-    };
+    }
 
-    let compiled = compile_with_product_id(
-        plan,
-        resolved_product
-            .as_ref()
-            .map(|product| product.product_id.as_str()),
-    )
+    /*
+     * Compile using canonical product identity.
+     *
+     * Single product:
+     *     p.id = $N
+     *
+     * Multi-product B5:
+     *     p.id IN ($N, $N+1, ...)
+     */
+    let compiled = if !plan.filters.products.is_empty() {
+        let resolved_product_id_refs = resolved_product_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        compile_with_product_ids(plan, &resolved_product_id_refs)
+    } else {
+        compile_with_product_id(
+            plan,
+            resolved_product
+                .as_ref()
+                .map(|product| product.product_id.as_str()),
+        )
+    }
     .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
     #[cfg(debug_assertions)]

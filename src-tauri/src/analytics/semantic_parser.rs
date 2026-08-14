@@ -136,6 +136,7 @@ pub(crate) fn parse_semantic_plan(
         status_filters,
         store_id: None,
         product: None,
+        products: Vec::new(),
         variant_id: None,
     };
     let ranking =

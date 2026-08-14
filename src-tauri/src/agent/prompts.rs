@@ -31,12 +31,13 @@ An analytics-plan response must look like this valid example:
       }
     ],
     "filters":{
-      "exclude_cancelled":false,
-      "status_filters":[],
-      "store_id":null,
-      "product":null,
-      "variant_id":null
-    },
+  "exclude_cancelled":false,
+  "status_filters":[],
+  "store_id":null,
+  "product":null,
+  "products":[],
+  "variant_id":null
+}
     "sort":"chronological",
     "limit":null,
     "visualization":"bar"
@@ -84,6 +85,7 @@ Return semantics equivalent to:
       ],
       "store_id":null,
       "product":null,
+      "products":[],
       "variant_id":null
     },
     "sort":null,
@@ -162,12 +164,31 @@ Routing rules:
   domain=products
   dimensions=[]
   filters.product=<named product>
+  filters.products=[]
   filters.exclude_cancelled=true
   sort=null
   limit=null
-  visualization=table
-- specialized_tool=product_performance is reserved for comparative product/SKU performance algorithms that require distinct current and baseline windows, such as "Which SKUs performed worse in June compared with May?"
-- Do not use specialized_tool=product_performance for a single named-product performance snapshot.
+  visualization=table.
+- A comparison of an explicit finite set of two through ten named products MUST also use analytics_plan when the requested metrics and periods are representable by the typed analytics contract.
+- Explicit selected-product comparisons use filters.products, not filters.product.
+- For an explicit selected-product comparison:
+  domain=products
+  dimensions must include product
+  filters.product=null
+  filters.products=<the named product mentions in the user's requested order>
+  filters.variant_id=null
+  filters.exclude_cancelled=true
+  limit=null.
+- A generic request such as "Compare Product A, Product B and Product C" means the four core product-performance metrics:
+  quantity_sold,
+  product_order_count,
+  product_unique_customers,
+  product_sales_value.
+- When the user explicitly asks for only certain supported metrics, preserve only those metrics. Do not automatically add the remaining product-performance metrics.
+- "Which of these products performed best?" where "these products" refers to an explicit selected set remains an analytics_plan selected-product comparison. It is not a catalogue-wide ranking.
+- Do not use filters.products for an open-ended catalogue request such as "Which products sold the most?", "Which products gained the most?", "show the biggest losers", or another request whose product population is not an explicitly named finite comparison set.
+- specialized_tool=product_performance is reserved for broader product/SKU comparison algorithms that are not an explicit selected-product comparison representable by analytics_plan, including catalogue-wide current-versus-baseline investigations such as "Which SKUs performed worse in June compared with May?"
+- Do not use specialized_tool=product_performance for a single named-product performance snapshot or for a representable explicit selected-product comparison.
 
 Canonical named-product performance example:
 
@@ -203,6 +224,7 @@ filters={
   "status_filters":[],
   "store_id":null,
   "product":"MP Sharbati Atta",
+  "products":[],
   "variant_id":null
 }
 
@@ -214,6 +236,130 @@ The named product is a filter.
 Do not add dimension=product.
 Do not add dimension=variant.
 Rust owns automatic variant expansion after the typed product plan executes.
+
+Canonical selected multi-product comparison example:
+
+User request:
+"Compare MP Sharbati Atta, Khapli Atta and Multigrain Atta in July 2026."
+
+Return semantics equivalent to:
+
+route=analytics_plan
+analysis_depth=summary
+
+domain=products
+
+metrics=[
+  quantity_sold,
+  product_order_count,
+  product_unique_customers,
+  product_sales_value
+]
+
+dimensions=[product]
+
+periods=[
+  {
+    "label":"July 2026",
+    "start":"2026-07-01",
+    "end_exclusive":"2026-08-01"
+  }
+]
+
+filters={
+  "exclude_cancelled":true,
+  "status_filters":[],
+  "store_id":null,
+  "product":null,
+  "products":[
+    "MP Sharbati Atta",
+    "Khapli Atta",
+    "Multigrain Atta"
+  ],
+  "variant_id":null
+}
+
+sort=descending
+limit=null
+visualization=table
+
+Rules illustrated by this example:
+- filters.products represents an explicit selected comparison set.
+- Preserve each user's product mention separately and preserve requested order.
+- Do not join several product names into one filters.product string.
+- filters.product must be null when filters.products is non-empty.
+- dimension=product is required because the requested products must remain separate result groups.
+- Generic "compare these products" means the four core product-performance metrics.
+- limit=null because an explicit selected comparison set must never be silently truncated.
+- Rust resolves every product mention independently to current published catalogue identity before analytical SQL executes.
+- Product mentions are labels for resolution only. Never invent product IDs.
+
+Canonical selected multi-product explicit-metric example:
+
+User request:
+"Compare orders and buyers for MP Sharbati Atta and Khapli Atta in July 2026."
+
+Return semantics equivalent to:
+
+domain=products
+metrics=[
+  product_order_count,
+  product_unique_customers
+]
+dimensions=[product]
+filters.product=null
+filters.products=[
+  "MP Sharbati Atta",
+  "Khapli Atta"
+]
+filters.exclude_cancelled=true
+sort=descending
+limit=null
+visualization=table
+
+Do not add quantity_sold or product_sales_value because the user explicitly requested only orders and buyers.
+
+Canonical selected multi-product time-series example:
+
+User request:
+"Compare MP Sharbati Atta and Khapli Atta month by month from May through July 2026."
+
+Return semantics equivalent to:
+
+domain=products
+
+metrics=[
+  quantity_sold,
+  product_order_count,
+  product_unique_customers,
+  product_sales_value
+]
+
+dimensions=[
+  month,
+  product
+]
+
+periods=[
+  {
+    "label":"May through July 2026",
+    "start":"2026-05-01",
+    "end_exclusive":"2026-08-01"
+  }
+]
+
+filters.product=null
+filters.products=[
+  "MP Sharbati Atta",
+  "Khapli Atta"
+]
+filters.exclude_cancelled=true
+sort=chronological
+limit=null
+visualization=line
+
+This is one continuous TimePeriod with dimensions month and product.
+Do not split May, June and July into three periods merely because three calendar months are named.
 
 Period-shape rules:
 - A continuous time-series request across a contiguous date range uses one TimePeriod covering the full range.
@@ -308,6 +454,12 @@ Constraint-preservation rules:
 - Cancellation count and cancellation rate are represented by cancelled_order_count and cancellation_rate themselves. Cancellation is not additionally represented through status_filters or exclude_cancelled.
 - Non-cancelled or qualifying population requests use exclude_cancelled=true.
 - Explicit product, variant, store, population, threshold, and period constraints must be represented in their corresponding fields.
+- One explicitly named parent product uses filters.product.
+- An explicit comparison set of two through ten named parent products uses filters.products.
+- Never collapse multiple independently named products into one filters.product string.
+- Never silently discard one member of an explicit selected-product comparison set.
+- filters.product and filters.products are mutually exclusive.
+- filters.variant_id and filters.products are mutually exclusive.
 - If the requested output shape cannot represent a required constraint, use generated_sql rather than weakening, replacing, duplicating, or silently dropping that constraint.
 - exclude_cancelled and status_filters have different meanings and must never substitute for one another.
 - exclude_cancelled=true means the broad qualifying/non-cancelled population.
@@ -357,7 +509,9 @@ Order population rules:
 
 Result-grain rules:
 - Product and variant are different analytical grains.
-- Product requests use dimension product and product identity product.id / product_variant.product_id.
+- Catalogue-wide product rankings and explicit selected multi-product comparisons use dimension product and product identity product.id / product_variant.product_id.
+- A single named parent product used as a filter does not require dimension product unless the user explicitly requests product grouping.
+- An explicit selected multi-product comparison always requires dimension product so the selected products remain separate analytical groups.
 - Variant or analytical SKU requests use dimension variant and line_item.variant_id / product_variant.id.
 - Literal product_variant.sku is not the normal analytical SKU.
 - Display titles are labels only and never define analytical grain.
@@ -392,17 +546,49 @@ Customer rules:
 - Customer names, phone numbers, emails, DOB, addresses, and coordinates must not be requested or emitted.
 
 Product mention resolution:
-- filters.product represents the product mention expressed or clearly implied by the user.
-- The user is not required to provide the exact catalogue title.
-- Preserve concise approximate product wording and spelling from the request when identifying the product.
-- Do not invent a database product ID.
-- Do not require the user to copy the exact catalogue title.
-- Rust resolves filters.product against current published products before deterministic analytics execute.
+- Exactly one named parent product always uses filters.product and filters.products=[].
+- This remains true for snapshots, monthly series, weekly series, daily series, and temporal comparisons of that one product.
+- Never put exactly one product mention in filters.products.
+- filters.products is valid only for an explicit selected comparison set containing at least two distinct named parent products.
+"Show monthly performance of Sharbati Atta from January to July 2026"
+-> filters.product="Sharbati Atta"
+-> filters.products=[]
+-> dimensions=[month]
+- filters.product represents one parent-product mention expressed or clearly implied by the user.
+- filters.products represents an explicit selected comparison set of two through ten parent-product mentions.
+- The user is not required to provide exact catalogue titles.
+- Preserve concise approximate product wording and spelling from the request when identifying products.
+- Preserve every selected-product mention as a separate string in filters.products.
+- Preserve the user's requested product order in filters.products.
+- Never combine multiple product mentions into one string.
+- Never invent a database product ID.
+- Do not require the user to copy exact catalogue titles.
+- Rust resolves filters.product against current published products before deterministic single-product analytics execute.
+- Rust resolves every filters.products entry independently against the same current published-product catalogue before deterministic multi-product analytics execute.
+- If any selected product is ambiguous or cannot be matched confidently, Rust owns the clarification/failure response. Do not silently replace, omit, or approximate away that product.
+- Different user mentions that resolve to the same canonical product are not two distinct comparison products; Rust validates canonical uniqueness.
 - Examples:
-  "show sharbati atta performance" -> filters.product="sharbati atta"
-  "how did MP sharbati do" -> filters.product="MP sharbati"
-  "show sharbti atta sales" -> filters.product="sharbti atta"
-- If the user names a product naturally, do not drop filters.product merely because the wording may not be an exact catalogue title.
+  "show sharbati atta performance"
+    -> filters.product="sharbati atta"
+       filters.products=[]
+
+  "how did MP sharbati do"
+    -> filters.product="MP sharbati"
+       filters.products=[]
+
+  "show sharbti atta sales"
+    -> filters.product="sharbti atta"
+       filters.products=[]
+
+  "compare sharbati atta and khapli atta"
+    -> filters.product=null
+       filters.products=["sharbati atta","khapli atta"]
+
+  "compare sharbti, khapli and multigrain"
+    -> filters.product=null
+       filters.products=["sharbti","khapli","multigrain"]
+
+- If the user names a product naturally, do not drop the corresponding product mention merely because the wording may not be an exact catalogue title.
 
 Money rules:
 - Generic order_value and average_order_value refer to qualifying operational order value unless the user explicitly requests another value concept.
@@ -424,6 +610,11 @@ Product metric rules:
 - Never sum variant order counts to obtain product order count.
 - Never sum variant unique-customer counts to obtain product unique customers.
 - Product analytical discovery, rankings, comparisons, and product-performance selection use current non-deleted published products only.
+- Explicit selected-product comparisons use the same product-grain metric definitions as catalogue product analytics; selecting a finite set does not change metric semantics.
+- For filters.products comparisons, product_order_count and product_unique_customers are computed independently for every selected product at product grain.
+- Never calculate selected-product order count or buyer count by summing variant-level values.
+- For a generic selected-product performance comparison, use quantity_sold, product_order_count, product_unique_customers, and product_sales_value.
+- For an explicit selected-product metric request, return only the requested supported metrics.
 - Historical variants belonging to an eligible published product remain valid analytical history even when those variant rows were later soft-deleted.
 - When products or variants are the subject and the user asks how many distinct orders contained them, or ranks products by orders, use product_order_count rather than generic order_count.
 - When products or variants are the subject and the user asks for distinct buyers/customers per product or variant, use product_unique_customers rather than generic unique_customers.
@@ -462,6 +653,7 @@ filters={
   "status_filters":[],
   "store_id":null,
   "product":"MP Sharbati Atta",
+  "products":[],
   "variant_id":null
 }
 
@@ -509,6 +701,7 @@ filters={
   "status_filters":[],
   "store_id":null,
   "product":"Sharbati Wheat Atta",
+  "products":[],
   "variant_id":null
 }
 
@@ -653,6 +846,7 @@ Forecast-plan shape:
     "status_filters":[],
     "store_id":null,
     "product":null,
+    "products":[],
     "variant_id":null
   }
 }
