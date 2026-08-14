@@ -1,10 +1,14 @@
 use super::{
     compiler::{compile_with_product_id, CompiledAnalyticsQuery},
     facts::{
-        build_time_series_facts, enrich_temporal_variant_contribution_facts,
+        build_temporal_variant_mix_shift_facts, build_time_series_facts,
+        derive_temporal_variant_mix_shift_driver_facts, enrich_temporal_variant_contribution_facts,
         enrich_variant_contribution_facts,
     },
-    insights::{summarize_metric_query_with_facts, summarize_variant_contribution_facts},
+    insights::{
+        summarize_metric_query_with_facts, summarize_temporal_variant_mix_shift_driver_facts,
+        summarize_variant_contribution_facts,
+    },
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
     product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
 };
@@ -319,6 +323,7 @@ pub(crate) async fn execute_semantic_plan(
      */
     let mut variant_execution = None;
     let mut variant_contribution_facts = None;
+    let mut temporal_variant_driver_facts = None;
 
     if let Some(variant_plan) = derive_variant_expansion_plan(plan) {
         variant_plan
@@ -402,6 +407,58 @@ pub(crate) async fn execute_semantic_plan(
                             )
                         })?;
 
+                let mix_shift_facts =
+                    build_temporal_variant_mix_shift_facts(plan, &result, &variant_result)
+                        .ok_or_else(|| {
+                            AgentError::InvalidPlan(
+                                "temporal variant mix shift could not determine its time axis"
+                                    .to_owned(),
+                            )
+                        })?;
+
+                #[cfg(debug_assertions)]
+                {
+                    let variant_fact_count = mix_shift_facts
+                        .transitions
+                        .iter()
+                        .map(|transition| transition.variants.len())
+                        .sum::<usize>();
+
+                    eprintln!(
+        "[analytics temporal variant mix shift]\nrequest_id={}\nbucket_transitions={}\nvariant_transition_facts={}",
+        request_id,
+        mix_shift_facts.transitions.len(),
+        variant_fact_count,
+    );
+                }
+
+                /*
+                 * B4-B computes deterministic transition facts.
+                 * B4-C will consume them for gain/loss summaries.
+                 */
+                let mix_shift_driver_facts =
+                    derive_temporal_variant_mix_shift_driver_facts(&mix_shift_facts);
+
+                #[cfg(debug_assertions)]
+                if let Some(latest) = mix_shift_driver_facts.transitions.last() {
+                    eprintln!(
+        "[analytics temporal variant drivers]\nrequest_id={}\nfrom_bucket={}\nto_bucket={}\nquantity_gain={:?}\nquantity_loss={:?}\nsales_gain={:?}\nsales_loss={:?}\norder_penetration_gain={:?}\norder_penetration_loss={:?}\nbuyer_penetration_gain={:?}\nbuyer_penetration_loss={:?}",
+        request_id,
+        latest.from_bucket,
+        latest.to_bucket,
+        latest.largest_quantity_mix_gain,
+        latest.largest_quantity_mix_loss,
+        latest.largest_sales_mix_gain,
+        latest.largest_sales_mix_loss,
+        latest.largest_order_penetration_gain,
+        latest.largest_order_penetration_loss,
+        latest.largest_buyer_penetration_gain,
+        latest.largest_buyer_penetration_loss,
+    );
+                }
+
+                temporal_variant_driver_facts = Some(mix_shift_driver_facts);
+
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "[analytics temporal variant contribution]\nrequest_id={}\nbuckets={:?}",
@@ -472,6 +529,15 @@ pub(crate) async fn execute_semantic_plan(
 
     if let Some(contribution_facts) = variant_contribution_facts.as_ref() {
         if let Some(driver_summary) = summarize_variant_contribution_facts(contribution_facts) {
+            answer.push_str("\n\n");
+            answer.push_str(&driver_summary);
+        }
+    }
+
+    if let Some(driver_facts) = temporal_variant_driver_facts.as_ref() {
+        if let Some(driver_summary) =
+            summarize_temporal_variant_mix_shift_driver_facts(driver_facts)
+        {
             answer.push_str("\n\n");
             answer.push_str(&driver_summary);
         }
