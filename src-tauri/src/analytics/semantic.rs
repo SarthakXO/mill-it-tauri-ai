@@ -1,8 +1,9 @@
 use super::{
-    compiler::{compile, CompiledAnalyticsQuery},
+    compiler::{compile_with_product_id, CompiledAnalyticsQuery},
     facts::build_time_series_facts,
     insights::summarize_metric_query_with_facts,
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
+    product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
 };
 use crate::{
     agent::{AgentError, AgentResponse, ChartType, WarningBlock},
@@ -18,6 +19,28 @@ pub(crate) struct SemanticExecution {
     pub(crate) db_duration_ms: u128,
     pub(crate) calculation_duration_ms: u128,
     pub(crate) summary_duration_ms: u128,
+}
+
+fn attach_resolved_product_identity(result: &mut QueryResult, product: &ResolvedProduct) {
+    for row in &mut result.rows {
+        row.insert(
+            "product_name".to_owned(),
+            Value::String(product.product_name.clone()),
+        );
+
+        row.insert(
+            "product_id".to_owned(),
+            Value::String(product.product_id.clone()),
+        );
+    }
+
+    result
+        .columns
+        .retain(|column| column != "product_name" && column != "product_id");
+
+    result.columns.insert(0, "product_id".to_owned());
+
+    result.columns.insert(0, "product_name".to_owned());
 }
 
 fn is_core_product_performance_metric(metric: Metric) -> bool {
@@ -97,8 +120,100 @@ pub(crate) async fn execute_semantic_plan(
 ) -> Result<SemanticExecution, AgentError> {
     plan.validate()
         .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+    let mut resolver_db_duration_ms = 0_u128;
 
-    let compiled = compile(plan).map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+    let resolved_product = if plan.domain == AnalyticsDomain::Products {
+        if let Some(mention) = plan.filters.product.as_deref() {
+            let lookup = resolve_product(database, mention).await?;
+
+            resolver_db_duration_ms = lookup.db_duration_ms;
+
+            match lookup.resolution {
+                ProductResolution::Resolved(product) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
+                        request_id,
+                        mention,
+                        product.product_id,
+                        product.product_name,
+                        product.score
+                    );
+
+                    Some(product)
+                }
+
+                ProductResolution::Ambiguous(candidates) => {
+                    let choices = candidates
+                        .iter()
+                        .map(|candidate| candidate.product_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
+                        request_id,
+                        mention,
+                        choices
+                    );
+
+                    return Ok(
+                        SemanticExecution {
+                            response:
+                                AgentResponse::text(
+                                    format!(
+                                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
+                                    ),
+                                ),
+                            rows: 0,
+                            db_duration_ms:
+                                resolver_db_duration_ms,
+                            calculation_duration_ms: 0,
+                            summary_duration_ms: 0,
+                        },
+                    );
+                }
+
+                ProductResolution::NotFound => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
+                        request_id,
+                        mention
+                    );
+
+                    return Ok(
+                        SemanticExecution {
+                            response:
+                                AgentResponse::text(
+                                    format!(
+                                        "I couldn't confidently match \"{mention}\" to a current published product."
+                                    ),
+                                ),
+                            rows: 0,
+                            db_duration_ms:
+                                resolver_db_duration_ms,
+                            calculation_duration_ms: 0,
+                            summary_duration_ms: 0,
+                        },
+                    );
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let compiled = compile_with_product_id(
+        plan,
+        resolved_product
+            .as_ref()
+            .map(|product| product.product_id.as_str()),
+    )
+    .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
     #[cfg(debug_assertions)]
     {
@@ -140,7 +255,22 @@ pub(crate) async fn execute_semantic_plan(
         .execute_deterministic(&validated, &compiled.parameters)
         .await?;
 
-    let mut db_duration_ms = result.duration_ms;
+    if let Some(product) = resolved_product.as_ref() {
+        /*
+         * Product/variant grouped queries already return their own
+         * identity columns.
+         *
+         * The scalar parent product-performance query does not, so
+         * attach its canonical resolved identity here.
+         */
+        if !plan.dimensions.contains(&Dimension::Product)
+            && !plan.dimensions.contains(&Dimension::Variant)
+        {
+            attach_resolved_product_identity(&mut result, product);
+        }
+    }
+
+    let mut db_duration_ms = resolver_db_duration_ms + result.duration_ms;
 
     /*
      * Rust-owned automatic variant expansion.
@@ -155,8 +285,13 @@ pub(crate) async fn execute_semantic_plan(
             .validate()
             .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
-        let variant_compiled =
-            compile(&variant_plan).map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+        let variant_compiled = compile_with_product_id(
+            &variant_plan,
+            resolved_product
+                .as_ref()
+                .map(|product| product.product_id.as_str()),
+        )
+        .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
         #[cfg(debug_assertions)]
         {

@@ -391,6 +391,19 @@ Customer rules:
 - Customer PII is not selected by the semantic planner.
 - Customer names, phone numbers, emails, DOB, addresses, and coordinates must not be requested or emitted.
 
+Product mention resolution:
+- filters.product represents the product mention expressed or clearly implied by the user.
+- The user is not required to provide the exact catalogue title.
+- Preserve concise approximate product wording and spelling from the request when identifying the product.
+- Do not invent a database product ID.
+- Do not require the user to copy the exact catalogue title.
+- Rust resolves filters.product against current published products before deterministic analytics execute.
+- Examples:
+  "show sharbati atta performance" -> filters.product="sharbati atta"
+  "how did MP sharbati do" -> filters.product="MP sharbati"
+  "show sharbti atta sales" -> filters.product="sharbti atta"
+- If the user names a product naturally, do not drop filters.product merely because the wording may not be an exact catalogue title.
+
 Money rules:
 - Generic order_value and average_order_value refer to qualifying operational order value unless the user explicitly requests another value concept.
 - Generic qualifying order value uses the latest applicable active/non-cancelled payment amount at order grain, minus applicable processed partial-cancellation refund value, with computed net-item order value only as a clearly identified fallback.

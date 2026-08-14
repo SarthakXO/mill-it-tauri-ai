@@ -573,6 +573,11 @@ impl<'a> AgentOrchestrator<'a> {
                         &request.current_user_message,
                     );
 
+                    normalize_explicit_single_calendar_month(
+                        &mut route,
+                        &request.current_user_message,
+                    );
+
                     normalize_explicit_product_sales_value(
                         &mut route,
                         &request.current_user_message,
@@ -1441,6 +1446,100 @@ fn normalize_analysis_depth(route: &mut SemanticPlannerResponse, question: &str)
     if requires_deep_analysis(question) {
         route.analysis_depth = AnalysisDepth::Deep;
     }
+}
+
+fn normalize_explicit_single_calendar_month(route: &mut SemanticPlannerResponse, question: &str) {
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    if plan.periods.len() != 1 {
+        return;
+    }
+
+    let normalized = question.to_ascii_lowercase();
+
+    if normalized.contains("compare")
+        || normalized.contains(" versus ")
+        || normalized.contains(" vs ")
+        || normalized.contains(" through ")
+        || normalized.contains(" thru ")
+        || normalized.contains("previous month")
+        || normalized.contains("prior month")
+    {
+        return;
+    }
+
+    let months = [
+        ("january", 1_u32),
+        ("february", 2),
+        ("march", 3),
+        ("april", 4),
+        ("may", 5),
+        ("june", 6),
+        ("july", 7),
+        ("august", 8),
+        ("september", 9),
+        ("october", 10),
+        ("november", 11),
+        ("december", 12),
+    ];
+
+    let matched_months = months
+        .iter()
+        .filter(|(name, _)| {
+            normalized
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|token| token == *name)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+
+    if matched_months.len() != 1 {
+        return;
+    }
+
+    let year = normalized
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<i32>().ok())
+        .find(|year| (2000..=2100).contains(year));
+
+    let Some(year) = year else {
+        return;
+    };
+
+    let (month_name, month) = matched_months[0];
+
+    let Some(start) = chrono::NaiveDate::from_ymd_opt(year, month, 1) else {
+        return;
+    };
+
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+
+    let Some(end_exclusive) = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1) else {
+        return;
+    };
+
+    let period = &mut plan.periods[0];
+
+    period.start = start;
+    period.end_exclusive = end_exclusive;
+    period.label = format!("{} {}", capitalize_ascii(month_name), year);
+}
+
+fn capitalize_ascii(value: &str) -> String {
+    let mut characters = value.chars();
+
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+
+    format!("{}{}", first.to_ascii_uppercase(), characters.as_str())
 }
 
 fn requires_deep_analysis(question: &str) -> bool {
@@ -5063,5 +5162,88 @@ mod tests {
         );
 
         assert_eq!(route.plan.unwrap().metrics, vec![Metric::QuantitySold]);
+    }
+    #[test]
+    fn explicit_named_month_repairs_end_at_historical_boundary() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("MP Sharbati Atta".to_owned()),
+                    exclude_cancelled: true,
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_single_calendar_month(
+            &mut route,
+            "Show performance of MP Sharbati Atta in July 2026.",
+        );
+
+        let period = &route.plan.unwrap().periods[0];
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+
+        assert_eq!(
+            period.end_exclusive,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
+        );
+
+        assert_eq!(period.label, "July 2026");
+    }
+    #[test]
+    fn relative_month_period_is_not_reinterpreted() {
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "Last month".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: None,
+                limit: None,
+                visualization: None,
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        let original = route.plan.as_ref().unwrap().periods[0].clone();
+
+        normalize_explicit_single_calendar_month(&mut route, "Show performance last month.");
+
+        assert_eq!(route.plan.unwrap().periods[0], original);
     }
 }

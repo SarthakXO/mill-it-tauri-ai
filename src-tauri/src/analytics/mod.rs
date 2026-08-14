@@ -10,6 +10,7 @@ mod intent;
 mod operation;
 mod operation_parser;
 mod orders;
+mod product_resolver;
 mod products;
 mod query;
 mod semantic;

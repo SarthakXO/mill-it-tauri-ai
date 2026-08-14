@@ -394,23 +394,46 @@ const fn is_numeric_type(value_type: ColumnType) -> bool {
 
 fn column_priority(key: &str) -> (u8, String) {
     let normalized = key.to_lowercase();
-    let priority = if normalized == "variant" {
+
+    let priority = if matches!(
+        normalized.as_str(),
+        "name"
+            | "product_name"
+            | "product_title"
+            | "variant"
+            | "variant_name"
+            | "variant_title"
+            | "customer_name"
+            | "full_name"
+            | "first_name"
+            | "store_name"
+    ) {
+        // Human-readable identity always wins.
         0
-    } else if normalized.contains("status") || normalized == "period" {
-        1
-    } else if normalized == "day" || normalized.contains("date") {
-        2
     } else if normalized.ends_with("_id") || normalized == "id" {
-        4
+        // Technical identity directly follows the name.
+        1
+    } else if normalized.contains("status") || normalized == "period" {
+        2
+    } else if normalized == "day"
+        || normalized == "week"
+        || normalized == "month"
+        || normalized.contains("date")
+    {
+        3
     } else if normalized.contains("count")
         || normalized.contains("quantity")
         || normalized.contains("total")
-        || normalized == "value"
+        || normalized.contains("value")
+        || normalized.contains("percentage")
+        || normalized.ends_with("_pct")
+        || normalized.ends_with("_rate")
     {
         5
     } else {
-        3
+        4
     };
+
     (priority, normalized)
 }
 
@@ -431,12 +454,17 @@ fn individual_order_priority(key: &str) -> (u8, String) {
 
 fn customer_record_priority(key: &str) -> (u8, String) {
     let normalized = key.to_lowercase();
+
     let priority = match normalized.as_str() {
-        "customer_id" => 0,
-        "first_name" => 1,
+        "customer_name" | "full_name" | "first_name" => 0,
+
+        "customer_id" => 1,
+
         "phone" => 2,
+
         _ => 3,
     };
+
     (priority, normalized)
 }
 
@@ -595,5 +623,52 @@ mod tests {
                 "created_at"
             ]
         );
+    }
+    #[test]
+    fn variant_title_precedes_technical_variant_id() {
+        let row = Map::from_iter([
+            ("variant_id".to_owned(), Value::from("variant_123")),
+            ("variant_title".to_owned(), Value::from("Regular - 5 kg")),
+            ("quantity_sold".to_owned(), Value::from(120)),
+            ("product_sales_value".to_owned(), Value::from(14_000.0)),
+        ]);
+
+        let result = QueryResult {
+            columns: vec![
+                "variant_id".to_owned(),
+                "variant_title".to_owned(),
+                "quantity_sold".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![row],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let response = AgentResponse::from_query(
+            "Variant performance".to_owned(),
+            "Show variant performance",
+            "semantic product performance",
+            "ranking",
+            &result,
+            None,
+            None,
+        );
+
+        let keys = response.tables[0]
+            .columns
+            .iter()
+            .map(|column| column.key.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys[0], "variant_title");
+
+        assert_eq!(keys[1], "variant_id");
+    }
+    #[test]
+    fn product_name_precedes_product_id() {
+        assert!(column_priority("product_name") < column_priority("product_id"));
     }
 }

@@ -16,6 +16,13 @@ pub(crate) struct CompiledAnalyticsQuery {
 }
 
 pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, CompileError> {
+    compile_with_product_id(plan, None)
+}
+
+pub(crate) fn compile_with_product_id(
+    plan: &AnalyticsPlan,
+    resolved_product_id: Option<&str>,
+) -> Result<CompiledAnalyticsQuery, CompileError> {
     plan.validate()
         .map_err(|error| CompileError(error.to_string()))?;
     let mut parameters = period_parameters(plan);
@@ -50,6 +57,7 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
     });
     let catalogue_scoped_product_query = product_dimension
         || variant_dimension
+        || resolved_product_id.is_some()
         || plan.filters.product.is_some()
         || plan.filters.variant_id.is_some();
 
@@ -125,13 +133,24 @@ pub(crate) fn compile(plan: &AnalyticsPlan) -> Result<CompiledAnalyticsQuery, Co
         plan.filters.store_id.as_deref(),
         "o.store_id =",
     );
-    if let Some(product) = plan.filters.product.as_deref() {
+    if let Some(product_id) = resolved_product_id {
+        parameters.push(QueryParameter::String(product_id.to_owned()));
+
+        where_parts.push(format!("p.id = (${}::text)", parameters.len()));
+    } else if let Some(product) = plan.filters.product.as_deref() {
+        /*
+         * Legacy/direct compiler fallback.
+         *
+         * Normal semantic execution resolves product mentions before
+         * compilation and therefore uses exact product identity above.
+         */
         parameters.push(QueryParameter::String(product.to_owned()));
+
         where_parts.push(format!(
-            "(lower(li.title) LIKE '%' || lower((${}::text)) || '%' OR lower(COALESCE(p.title, '')) LIKE '%' || lower((${}::text)) || '%')",
-            parameters.len(),
-            parameters.len()
-        ));
+        "(lower(li.title) LIKE '%' || lower((${}::text)) || '%' OR lower(COALESCE(p.title, '')) LIKE '%' || lower((${}::text)) || '%')",
+        parameters.len(),
+        parameters.len()
+    ));
     }
     add_string_filter(
         &mut where_parts,
@@ -800,5 +819,43 @@ mod tests {
         assert!(!compiled
             .sql
             .contains("lower(COALESCE(p.status::text, '')) = 'published'"));
+    }
+    #[test]
+    fn resolved_product_identity_replaces_fuzzy_name_filter() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("sharbti atta".to_owned()),
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+            sort: None,
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let compiled = compile_with_product_id(&plan, Some("prod_sharbati")).unwrap();
+
+        assert!(compiled.sql.contains("p.id = ($3::text)"));
+
+        assert!(!compiled.sql.contains("lower(li.title) LIKE"));
+
+        assert!(matches!(
+            compiled.parameters.last(),
+            Some(QueryParameter::String(value))
+                if value == "prod_sharbati"
+        ));
     }
 }
