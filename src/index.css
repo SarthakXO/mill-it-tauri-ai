@@ -1,20 +1,48 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink-950: #16211d;
-  --color-ink-800: #30413a;
-  --color-ink-600: #607069;
-  --color-ink-500: #78857f;
-  --color-surface: #f6f8f6;
-  --color-line: #dfe6e1;
-  --color-brand-700: #195c42;
-  --color-brand-600: #217354;
-  --color-brand-100: #dff1e8;
-  --color-brand-50: #eff8f3;
+  --color-ink-950: var(--text-primary);
+  --color-ink-800: var(--text-primary-soft);
+  --color-ink-600: var(--text-secondary);
+  --color-ink-500: var(--muted);
+  --color-surface: var(--background);
+  --color-panel: var(--surface);
+  --color-panel-elevated: var(--surface-elevated);
+  --color-line: var(--border);
+  --color-brand-700: var(--accent-strong);
+  --color-brand-600: var(--accent);
+  --color-brand-100: var(--selected);
+  --color-brand-50: var(--hover);
+  --color-warning: var(--warning-background);
+  --color-warning-border: var(--warning-border);
+  --color-warning-text: var(--warning-text);
+  --color-danger: var(--danger);
 }
 
 @layer base {
   :root {
+    --background: #101613;
+    --surface: #171f1b;
+    --surface-elevated: #202a25;
+    --border: #34423b;
+    --text-primary: #f2f7f4;
+    --text-primary-soft: #d9e3de;
+    --text-secondary: #aebdb5;
+    --muted: #8c9c94;
+    --accent: #54c395;
+    --accent-strong: #36a979;
+    --hover: #223b31;
+    --selected: #28523f;
+    --chart-grid: #33423b;
+    --chart-axis: #708078;
+    --chart-tooltip-background: #26322c;
+    --chart-tooltip-text: #f5faf7;
+    --warning-background: #372d18;
+    --warning-border: #6d5727;
+    --warning-text: #f2d88f;
+    --danger: #ff9b9b;
+    --scrollbar: #52645b;
+    --shadow-card: 0 2px 12px rgb(0 0 0 / 0.2);
     font-family:
       Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
       sans-serif;
@@ -24,6 +52,31 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  :root[data-theme="light"] {
+    --background: #f6f8f6;
+    --surface: #ffffff;
+    --surface-elevated: #fbfcfb;
+    --border: #dfe6e1;
+    --text-primary: #16211d;
+    --text-primary-soft: #30413a;
+    --text-secondary: #607069;
+    --muted: #78857f;
+    --accent: #217354;
+    --accent-strong: #195c42;
+    --hover: #eff8f3;
+    --selected: #dff1e8;
+    --chart-grid: #dfe6e1;
+    --chart-axis: #aab8b0;
+    --chart-tooltip-background: #16211d;
+    --chart-tooltip-text: #ffffff;
+    --warning-background: #fffbeb;
+    --warning-border: #fde68a;
+    --warning-text: #78350f;
+    --danger: #b91c1c;
+    --scrollbar: #cbd5cf;
+    --shadow-card: 0 2px 10px rgb(22 33 29 / 0.04);
   }
 
   * {
@@ -38,14 +91,34 @@
   }
 
   button,
-  textarea {
+  textarea,
+  select,
+  input {
     font: inherit;
+  }
+
+  button:not(:disabled),
+  select:not(:disabled),
+  input[type="checkbox"]:not(:disabled) {
+    cursor: pointer;
   }
 }
 
 @layer utilities {
   .chat-scrollbar {
-    scrollbar-color: #cbd5cf transparent;
+    scrollbar-color: var(--scrollbar) transparent;
     scrollbar-width: thin;
+  }
+
+  .card-shadow {
+    box-shadow: var(--shadow-card);
+  }
+
+  .analytics-row:hover > td {
+    background: var(--hover);
+  }
+
+  .analytics-row[data-selected="true"] > td {
+    background: var(--selected);
   }
 }

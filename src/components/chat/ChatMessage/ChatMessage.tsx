@@ -10,7 +10,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
   const isError = message.content.type === "text" && message.content.tone === "error";
 
   return (
-    <article className={isUser ? "bg-white" : "bg-surface"}>
+    <article className={isUser ? "bg-panel" : "bg-surface"}>
       <div
         className={`mx-auto flex w-full gap-4 px-6 py-6 sm:px-8 ${
           isUser ? "max-w-3xl" : "max-w-5xl"
@@ -36,7 +36,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
           ) : (
             <div
               className={`whitespace-pre-wrap break-words text-[0.9375rem] leading-6 ${
-                isError ? "text-red-700" : "text-ink-800"
+                isError ? "text-danger" : "text-ink-800"
               }`}
             >
               {message.content.text}

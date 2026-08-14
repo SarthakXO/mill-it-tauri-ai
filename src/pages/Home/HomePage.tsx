@@ -32,8 +32,10 @@ export function HomePage() {
   const [thinkingEnabled, setThinkingEnabled] = useState(
     () => localStorage.getItem("millit-thinking-enabled") === "true",
   );
+  const thinkingEnabledRef = useRef(thinkingEnabled);
 
   const toggleThinking = (enabled: boolean) => {
+    thinkingEnabledRef.current = enabled;
     setThinkingEnabled(enabled);
     localStorage.setItem("millit-thinking-enabled", String(enabled));
   };
@@ -49,7 +51,7 @@ export function HomePage() {
 
     try {
       const response = await invoke<AgentResponse>("chat_with_ollama", {
-        thinkingEnabled,
+        thinkingEnabled: thinkingEnabledRef.current,
         messages: conversation
           .filter(
             (message) => message.content.type !== "text" || message.content.tone !== "error",

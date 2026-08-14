@@ -42,6 +42,10 @@ export interface ChartBlock {
   yKey: string;
   xLabel: string;
   yLabel: string;
+  seriesKey?: string;
+  seriesLabelKey?: string;
+  availableYKeys?: string[];
+  zeroFillMissingPoints?: boolean;
 }
 
 export interface WarningBlock {
