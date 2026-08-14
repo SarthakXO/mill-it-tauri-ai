@@ -70,6 +70,112 @@ impl AgentResponse {
             data_as_of: result.data_as_of.clone(),
         }
     }
+    pub(crate) fn rename_primary_table(&mut self, id: &str, title: &str) -> bool {
+        let Some(table) = self.tables.first_mut() else {
+            return false;
+        };
+
+        let previous_id = std::mem::replace(&mut table.id, id.to_owned());
+
+        table.title = title.to_owned();
+
+        /*
+         * Charts reference tables by dataset_id.
+         * Keep those references valid when the presentation layer
+         * gives the table a semantic ID.
+         */
+        for chart in &mut self.charts {
+            if chart.dataset_id == previous_id {
+                chart.dataset_id = id.to_owned();
+            }
+        }
+
+        true
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_multi_series_line_chart(
+        &mut self,
+        chart_id: &str,
+        dataset_id: &str,
+        title: &str,
+        x_key: &str,
+        y_key: &str,
+        series_key: &str,
+        series_label_key: &str,
+        available_y_keys: &[&str],
+        zero_fill_missing_points: bool,
+    ) -> bool {
+        let Some(table) = self.tables.iter().find(|table| table.id == dataset_id) else {
+            return false;
+        };
+
+        let Some(x_column) = table.columns.iter().find(|column| column.key == x_key) else {
+            return false;
+        };
+
+        let Some(y_column) = table
+            .columns
+            .iter()
+            .find(|column| column.key == y_key && is_numeric_type(column.value_type))
+        else {
+            return false;
+        };
+
+        if !table.columns.iter().any(|column| column.key == series_key) {
+            return false;
+        }
+
+        if !table
+            .columns
+            .iter()
+            .any(|column| column.key == series_label_key)
+        {
+            return false;
+        }
+
+        let available_y_keys = available_y_keys
+            .iter()
+            .filter_map(|key| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| column.key == *key && is_numeric_type(column.value_type))
+                    .map(|column| column.key.clone())
+            })
+            .collect::<Vec<_>>();
+
+        let chart = ChartBlock {
+            id: chart_id.to_owned(),
+            chart_type: ChartType::Line,
+            title: title.to_owned(),
+
+            dataset_id: dataset_id.to_owned(),
+
+            x_key: x_column.key.clone(),
+            y_key: y_column.key.clone(),
+
+            x_label: x_column.label.clone(),
+            y_label: y_column.label.clone(),
+
+            series_key: Some(series_key.to_owned()),
+
+            series_label_key: Some(series_label_key.to_owned()),
+
+            available_y_keys,
+
+            zero_fill_missing_points: Some(zero_fill_missing_points),
+        };
+
+        /*
+         * Replacing by ID makes repeated presentation decoration
+         * deterministic instead of producing duplicate charts.
+         */
+        self.charts.retain(|existing| existing.id != chart_id);
+
+        self.charts.push(chart);
+
+        true
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -107,14 +213,49 @@ pub(crate) enum ColumnType {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChartBlock {
     pub(crate) id: String,
+
     #[serde(rename = "type")]
     pub(crate) chart_type: ChartType,
+
     pub(crate) title: String,
+
     pub(crate) dataset_id: String,
+
     pub(crate) x_key: String,
     pub(crate) y_key: String,
+
     pub(crate) x_label: String,
     pub(crate) y_label: String,
+
+    /*
+     * Optional multi-series metadata.
+     *
+     * Example:
+     *   x_key = "month"
+     *   y_key = "quantity_sold"
+     *   series_key = "variant_id"
+     *   series_label_key = "variant_title"
+     */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) series_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) series_label_key: Option<String>,
+
+    /*
+     * Metrics backed by the same dataset that the frontend may
+     * switch between without another analytics request.
+     */
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) available_y_keys: Vec<String>,
+
+    /*
+     * Temporal variant queries omit zero-activity variant/bucket
+     * combinations from SQL. For these performance metrics a
+     * missing point therefore represents zero, not unknown data.
+     */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) zero_fill_missing_points: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -277,13 +418,34 @@ fn build_chart(
     {
         return None;
     }
-    let x_column = table.columns.iter().find(|column| {
-        !is_numeric_type(column.value_type)
-            && !column.key.contains("classification")
-            && !column.key.contains("confidence")
-    })?;
+    let x_column = if expected_shape == "time_series" {
+        ["day", "week", "month", "period"]
+            .iter()
+            .find_map(|key| table.columns.iter().find(|column| column.key == *key))
+            .or_else(|| {
+                table.columns.iter().find(|column| {
+                    !is_numeric_type(column.value_type)
+                        && !column.key.contains("classification")
+                        && !column.key.contains("confidence")
+                })
+            })?
+    } else {
+        table.columns.iter().find(|column| {
+            !is_numeric_type(column.value_type)
+                && !column.key.contains("classification")
+                && !column.key.contains("confidence")
+        })?
+    };
     let preferred_y_keys: &[&str] = if expected_shape == "time_series" {
-        &["projected_orders", "forecast_orders", "order_count"]
+        &[
+            "projected_orders",
+            "forecast_orders",
+            "order_count",
+            "quantity_sold",
+            "product_order_count",
+            "product_unique_customers",
+            "product_sales_value",
+        ]
     } else if expected_shape == "ranking" {
         &[
             "due_customers",
@@ -343,6 +505,11 @@ fn build_chart(
         y_key: y_column.key.clone(),
         x_label: x_column.label.clone(),
         y_label: y_column.label.clone(),
+
+        series_key: None,
+        series_label_key: None,
+        available_y_keys: Vec::new(),
+        zero_fill_missing_points: None,
     })
 }
 
@@ -370,6 +537,8 @@ fn infer_column_type(key: &str, rows: &[Map<String, Value>]) -> ColumnType {
     if normalized == "date"
         || normalized.ends_with("_date")
         || normalized == "day"
+        || normalized == "week"
+        || normalized == "month"
         || normalized == "period"
     {
         return ColumnType::Date;
@@ -686,5 +855,115 @@ mod tests {
     #[test]
     fn product_name_precedes_product_id() {
         assert!(column_priority("product_name") < column_priority("product_id"));
+    }
+    #[test]
+    fn renaming_primary_table_retargets_existing_chart() {
+        let mut row = Map::new();
+
+        row.insert("month".to_owned(), Value::String("2026-01-01".to_owned()));
+
+        row.insert("quantity_sold".to_owned(), Value::Number(100.into()));
+
+        let result = QueryResult {
+            columns: vec!["month".to_owned(), "quantity_sold".to_owned()],
+            rows: vec![row],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let mut response = AgentResponse::from_query(
+            "Monthly performance".to_owned(),
+            "Show monthly performance",
+            "product performance",
+            "time_series",
+            &result,
+            Some(ChartType::Line),
+            None,
+        );
+
+        assert_eq!(response.charts[0].dataset_id, "query-result");
+
+        assert!(response.rename_primary_table("product-performance", "Product performance",));
+
+        assert_eq!(response.tables[0].id, "product-performance");
+
+        assert_eq!(response.charts[0].dataset_id, "product-performance");
+    }
+    #[test]
+    fn creates_multi_series_variant_time_chart() {
+        let mut row = Map::new();
+
+        row.insert("month".to_owned(), Value::String("2026-01-01".to_owned()));
+
+        row.insert(
+            "variant_id".to_owned(),
+            Value::String("variant_1".to_owned()),
+        );
+
+        row.insert(
+            "variant_title".to_owned(),
+            Value::String("Regular - 5 kg".to_owned()),
+        );
+
+        row.insert("quantity_sold".to_owned(), Value::Number(172.into()));
+
+        let result = QueryResult {
+            columns: vec![
+                "month".to_owned(),
+                "variant_id".to_owned(),
+                "variant_title".to_owned(),
+                "quantity_sold".to_owned(),
+            ],
+            rows: vec![row],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let mut response = AgentResponse::from_query(
+            "Variant performance".to_owned(),
+            "Show monthly performance",
+            "variant performance",
+            "ranking",
+            &result,
+            None,
+            None,
+        );
+
+        assert!(response.rename_primary_table("variant-performance", "Variant performance",));
+
+        assert!(response.add_multi_series_line_chart(
+            "variant-performance-trend",
+            "variant-performance",
+            "Variant performance over time",
+            "month",
+            "quantity_sold",
+            "variant_id",
+            "variant_title",
+            &["quantity_sold"],
+            true,
+        ));
+
+        let chart = response
+            .charts
+            .iter()
+            .find(|chart| chart.id == "variant-performance-trend")
+            .unwrap();
+
+        assert_eq!(chart.dataset_id, "variant-performance");
+
+        assert_eq!(chart.x_key, "month");
+        assert_eq!(chart.y_key, "quantity_sold");
+
+        assert_eq!(chart.series_key.as_deref(), Some("variant_id"));
+
+        assert_eq!(chart.series_label_key.as_deref(), Some("variant_title"));
+
+        assert_eq!(chart.available_y_keys, vec!["quantity_sold".to_owned()]);
+
+        assert_eq!(chart.zero_fill_missing_points, Some(true));
     }
 }

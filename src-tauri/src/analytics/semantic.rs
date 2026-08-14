@@ -56,6 +56,18 @@ fn is_core_product_performance_metric(metric: Metric) -> bool {
     )
 }
 
+fn temporal_dimension_key(plan: &AnalyticsPlan) -> Option<&'static str> {
+    if plan.dimensions.contains(&Dimension::Day) {
+        Some("day")
+    } else if plan.dimensions.contains(&Dimension::Week) {
+        Some("week")
+    } else if plan.dimensions.contains(&Dimension::Month) {
+        Some("month")
+    } else {
+        None
+    }
+}
+
 fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> {
     if plan.domain != AnalyticsDomain::Products {
         return None;
@@ -497,11 +509,7 @@ pub(crate) async fn execute_semantic_plan(
             None,
         );
 
-        if let Some(primary_table) = response.tables.first_mut() {
-            primary_table.id = "product-performance".to_owned();
-
-            primary_table.title = "Product performance".to_owned();
-        }
+        response.rename_primary_table("product-performance", "Product performance");
 
         if let Some(mut variant_table) = variant_response.tables.into_iter().next() {
             variant_table.id = "variant-performance".to_owned();
@@ -509,6 +517,43 @@ pub(crate) async fn execute_semantic_plan(
             variant_table.title = "Variant performance".to_owned();
 
             response.tables.push(variant_table);
+
+            /*
+             * Temporal product performance gets an explicit
+             * multi-series variant chart.
+             *
+             * Single-period B3 snapshots remain table-only.
+             */
+            if let Some(x_key) = temporal_dimension_key(&variant_plan) {
+                let chart_added = response.add_multi_series_line_chart(
+                    "variant-performance-trend",
+                    "variant-performance",
+                    "Variant performance over time",
+                    x_key,
+                    "quantity_sold",
+                    "variant_id",
+                    "variant_title",
+                    &[
+                        "quantity_sold",
+                        "product_sales_value",
+                        "product_order_count",
+                        "product_unique_customers",
+                        "quantity_share_pct",
+                        "sales_value_share_pct",
+                        "order_penetration_pct",
+                        "buyer_penetration_pct",
+                    ],
+                    true,
+                );
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant chart]\nrequest_id={}\nadded={}\ndataset=variant-performance\nx_key={}\ny_key=quantity_sold\nseries_key=variant_id\nseries_label_key=variant_title\nzero_fill_missing_points=true",
+            request_id,
+            chart_added,
+            x_key,
+        );
+            }
         }
 
         response.warnings.extend(variant_response.warnings);
