@@ -1,5 +1,5 @@
 use super::{
-    facts::{AnalyticalFacts, MetricFacts},
+    facts::{AnalyticalFacts, MetricFacts, VariantContributionFacts, VariantDriverFact},
     plan::{AnalyticsPlan, Dimension, Metric},
 };
 use crate::database::QueryResult;
@@ -30,6 +30,124 @@ pub(crate) fn summarize_metric_query(plan: &AnalyticsPlan, result: &QueryResult)
         return multi_metric_summary(plan, result);
     }
     comparison_summary(plan, result, plan.metrics[0])
+}
+
+pub(crate) fn summarize_variant_contribution_facts(
+    facts: &VariantContributionFacts,
+) -> Option<String> {
+    if facts.variant_count < 2 {
+        return None;
+    }
+
+    let mut sentences = Vec::new();
+
+    append_quantity_and_sales_driver(
+        &mut sentences,
+        facts.top_quantity_variant.as_ref(),
+        facts.top_sales_value_variant.as_ref(),
+    );
+
+    append_order_and_buyer_driver(
+        &mut sentences,
+        facts.top_order_penetration_variant.as_ref(),
+        facts.top_buyer_penetration_variant.as_ref(),
+    );
+
+    if sentences.is_empty() {
+        None
+    } else {
+        Some(format!("Variant drivers: {}", sentences.join(" ")))
+    }
+}
+
+fn append_quantity_and_sales_driver(
+    sentences: &mut Vec<String>,
+    quantity: Option<&VariantDriverFact>,
+    sales: Option<&VariantDriverFact>,
+) {
+    match (quantity, sales) {
+        (Some(quantity), Some(sales)) if quantity.variant_id == sales.variant_id => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold and sales-value contribution at {:.1}%.",
+                quantity.variant_title,
+                quantity.percentage,
+                sales.percentage,
+            ));
+        }
+
+        (Some(quantity), Some(sales)) => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold.",
+                quantity.variant_title, quantity.percentage,
+            ));
+
+            sentences.push(format!(
+                "{} led sales-value contribution at {:.1}%.",
+                sales.variant_title, sales.percentage,
+            ));
+        }
+
+        (Some(quantity), None) => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold.",
+                quantity.variant_title, quantity.percentage,
+            ));
+        }
+
+        (None, Some(sales)) => {
+            sentences.push(format!(
+                "{} led sales-value contribution at {:.1}%.",
+                sales.variant_title, sales.percentage,
+            ));
+        }
+
+        (None, None) => {}
+    }
+}
+
+fn append_order_and_buyer_driver(
+    sentences: &mut Vec<String>,
+    orders: Option<&VariantDriverFact>,
+    buyers: Option<&VariantDriverFact>,
+) {
+    match (orders, buyers) {
+        (Some(orders), Some(buyers)) if orders.variant_id == buyers.variant_id => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}% and the highest buyer penetration at {:.1}%.",
+                orders.variant_title,
+                orders.percentage,
+                buyers.percentage,
+            ));
+        }
+
+        (Some(orders), Some(buyers)) => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}%.",
+                orders.variant_title, orders.percentage,
+            ));
+
+            sentences.push(format!(
+                "{} had the highest buyer penetration at {:.1}%.",
+                buyers.variant_title, buyers.percentage,
+            ));
+        }
+
+        (Some(orders), None) => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}%.",
+                orders.variant_title, orders.percentage,
+            ));
+        }
+
+        (None, Some(buyers)) => {
+            sentences.push(format!(
+                "{} had the highest buyer penetration at {:.1}%.",
+                buyers.variant_title, buyers.percentage,
+            ));
+        }
+
+        (None, None) => {}
+    }
 }
 
 pub(crate) fn summarize_metric_query_with_facts(
@@ -1216,5 +1334,80 @@ mod tests {
         assert!(summary.contains("product sales value ₹12,000.00"));
 
         assert!(!summary.contains("percentage change"));
+    }
+    #[test]
+    fn variant_driver_summary_combines_same_leaders() {
+        use crate::analytics::facts::{VariantContributionFacts, VariantDriverFact};
+
+        let facts = VariantContributionFacts {
+            variant_count: 3,
+            quantity_share_total_pct: Some(100.0),
+            sales_value_share_total_pct: Some(100.0),
+
+            top_quantity_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 42.4,
+            }),
+
+            top_sales_value_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 45.1,
+            }),
+
+            top_order_penetration_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Fine 5 kg".to_owned(),
+                percentage: 38.7,
+            }),
+
+            top_buyer_penetration_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Fine 5 kg".to_owned(),
+                percentage: 35.2,
+            }),
+        };
+
+        let summary = summarize_variant_contribution_facts(&facts).unwrap();
+
+        assert!(summary.contains(
+        "Regular 5 kg led quantity contribution at 42.4% of units sold and sales-value contribution at 45.1%."
+    ));
+
+        assert!(summary.contains(
+        "Fine 5 kg had the highest order penetration at 38.7% and the highest buyer penetration at 35.2%."
+    ));
+    }
+    #[test]
+    fn variant_driver_summary_preserves_different_leaders() {
+        use crate::analytics::facts::{VariantContributionFacts, VariantDriverFact};
+
+        let facts = VariantContributionFacts {
+            variant_count: 3,
+            quantity_share_total_pct: Some(100.0),
+            sales_value_share_total_pct: Some(100.0),
+
+            top_quantity_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 40.0,
+            }),
+
+            top_sales_value_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Coarse 10 kg".to_owned(),
+                percentage: 47.0,
+            }),
+
+            top_order_penetration_variant: None,
+            top_buyer_penetration_variant: None,
+        };
+
+        let summary = summarize_variant_contribution_facts(&facts).unwrap();
+
+        assert!(summary.contains("Regular 5 kg led quantity contribution at 40.0% of units sold."));
+
+        assert!(summary.contains("Coarse 10 kg led sales-value contribution at 47.0%."));
     }
 }

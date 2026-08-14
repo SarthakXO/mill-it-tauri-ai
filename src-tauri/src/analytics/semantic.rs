@@ -1,7 +1,7 @@
 use super::{
     compiler::{compile_with_product_id, CompiledAnalyticsQuery},
     facts::{build_time_series_facts, enrich_variant_contribution_facts},
-    insights::summarize_metric_query_with_facts,
+    insights::{summarize_metric_query_with_facts, summarize_variant_contribution_facts},
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
     product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
 };
@@ -279,6 +279,7 @@ pub(crate) async fn execute_semantic_plan(
      * Rust derives the variant-grain plan from that already validated plan.
      */
     let mut variant_execution = None;
+    let mut variant_contribution_facts = None;
 
     if let Some(variant_plan) = derive_variant_expansion_plan(plan) {
         variant_plan
@@ -343,6 +344,7 @@ pub(crate) async fn execute_semantic_plan(
          * Avoid redundant nesting when only one qualifying variant
          * is represented in the requested period.
          */
+
         if variant_result.row_count > 1 {
             let contribution_facts =
                 enrich_variant_contribution_facts(&result, &mut variant_result);
@@ -355,6 +357,18 @@ pub(crate) async fn execute_semantic_plan(
         contribution_facts.quantity_share_total_pct,
         contribution_facts.sales_value_share_total_pct,
     );
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+        "[analytics variant drivers]\nrequest_id={}\nquantity={:?}\nsales_value={:?}\norder_penetration={:?}\nbuyer_penetration={:?}",
+        request_id,
+        contribution_facts.top_quantity_variant,
+        contribution_facts.top_sales_value_variant,
+        contribution_facts.top_order_penetration_variant,
+        contribution_facts.top_buyer_penetration_variant,
+    );
+
+            variant_contribution_facts = Some(contribution_facts);
 
             variant_execution = Some((variant_plan, variant_compiled, variant_result));
         }
@@ -388,7 +402,14 @@ pub(crate) async fn execute_semantic_plan(
 
     let summary_started = Instant::now();
 
-    let answer = summarize_metric_query_with_facts(plan, &result, analytical_facts.as_ref());
+    let mut answer = summarize_metric_query_with_facts(plan, &result, analytical_facts.as_ref());
+
+    if let Some(contribution_facts) = variant_contribution_facts.as_ref() {
+        if let Some(driver_summary) = summarize_variant_contribution_facts(contribution_facts) {
+            answer.push_str("\n\n");
+            answer.push_str(&driver_summary);
+        }
+    }
 
     let chart_type = chart_type(plan);
 

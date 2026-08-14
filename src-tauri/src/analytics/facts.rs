@@ -87,12 +87,20 @@ const BUYER_PENETRATION_PCT: &str = "buyer_penetration_pct";
 pub(crate) struct VariantContributionFacts {
     pub(crate) variant_count: usize,
 
-    /*
-     * These should be approximately 100% when the variant rows
-     * fully partition the parent product population.
-     */
     pub(crate) quantity_share_total_pct: Option<f64>,
     pub(crate) sales_value_share_total_pct: Option<f64>,
+
+    pub(crate) top_quantity_variant: Option<VariantDriverFact>,
+    pub(crate) top_sales_value_variant: Option<VariantDriverFact>,
+    pub(crate) top_order_penetration_variant: Option<VariantDriverFact>,
+    pub(crate) top_buyer_penetration_variant: Option<VariantDriverFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VariantDriverFact {
+    pub(crate) variant_id: String,
+    pub(crate) variant_title: String,
+    pub(crate) percentage: f64,
 }
 
 pub(crate) fn enrich_variant_contribution_facts(
@@ -154,11 +162,21 @@ pub(crate) fn enrich_variant_contribution_facts(
 
     VariantContributionFacts {
         variant_count: variants.row_count,
+
         quantity_share_total_pct: complete_percentage_total(&variants.rows, QUANTITY_SHARE_PCT),
+
         sales_value_share_total_pct: complete_percentage_total(
             &variants.rows,
             SALES_VALUE_SHARE_PCT,
         ),
+
+        top_quantity_variant: top_variant_driver(&variants.rows, QUANTITY_SHARE_PCT),
+
+        top_sales_value_variant: top_variant_driver(&variants.rows, SALES_VALUE_SHARE_PCT),
+
+        top_order_penetration_variant: top_variant_driver(&variants.rows, ORDER_PENETRATION_PCT),
+
+        top_buyer_penetration_variant: top_variant_driver(&variants.rows, BUYER_PENETRATION_PCT),
     }
 }
 
@@ -193,6 +211,60 @@ fn complete_percentage_total(rows: &[Map<String, Value>], key: &str) -> Option<f
 
     rows.iter()
         .try_fold(0.0, |total, row| Some(total + row.get(key)?.as_f64()?))
+}
+
+fn top_variant_driver(
+    rows: &[Map<String, Value>],
+    percentage_key: &str,
+) -> Option<VariantDriverFact> {
+    let mut drivers = rows
+        .iter()
+        .filter_map(|row| {
+            let percentage = row.get(percentage_key)?.as_f64()?;
+
+            if !percentage.is_finite() {
+                return None;
+            }
+
+            let variant_id = row.get("variant_id")?.as_str()?.trim();
+
+            if variant_id.is_empty() {
+                return None;
+            }
+
+            let variant_title = row
+                .get("variant_title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(variant_id);
+
+            Some(VariantDriverFact {
+                variant_id: variant_id.to_owned(),
+                variant_title: variant_title.to_owned(),
+                percentage,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    /*
+     * Deterministic ordering:
+     *
+     * 1. highest percentage
+     * 2. title alphabetically
+     * 3. variant ID alphabetically
+     *
+     * The latter two only matter for exact ties.
+     */
+    drivers.sort_by(|left, right| {
+        right
+            .percentage
+            .total_cmp(&left.percentage)
+            .then_with(|| left.variant_title.cmp(&right.variant_title))
+            .then_with(|| left.variant_id.cmp(&right.variant_id))
+    });
+
+    drivers.into_iter().next()
 }
 
 fn metric_facts(
@@ -491,6 +563,31 @@ mod tests {
 
         let first = &variants.rows[0];
         let second = &variants.rows[1];
+        let top_quantity = facts.top_quantity_variant.as_ref().unwrap();
+
+        assert_eq!(top_quantity.variant_id, "variant_a");
+
+        assert_eq!(top_quantity.variant_title, "Variant A");
+
+        assert_close(top_quantity.percentage, 60.0);
+
+        let top_sales = facts.top_sales_value_variant.as_ref().unwrap();
+
+        assert_eq!(top_sales.variant_id, "variant_a");
+
+        assert_close(top_sales.percentage, 70.0);
+
+        let top_orders = facts.top_order_penetration_variant.as_ref().unwrap();
+
+        assert_eq!(top_orders.variant_id, "variant_a");
+
+        assert_close(top_orders.percentage, 70.0);
+
+        let top_buyers = facts.top_buyer_penetration_variant.as_ref().unwrap();
+
+        assert_eq!(top_buyers.variant_id, "variant_a");
+
+        assert_close(top_buyers.percentage, 75.0);
 
         assert_close(first["quantity_share_pct"].as_f64().unwrap(), 60.0);
 
