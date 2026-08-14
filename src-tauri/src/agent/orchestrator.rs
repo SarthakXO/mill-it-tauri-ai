@@ -568,7 +568,17 @@ impl<'a> AgentOrchestrator<'a> {
                 Ok(mut route) => {
                     normalize_analysis_depth(&mut route, &request.current_user_message);
 
-                    normalize_named_product_performance_snapshot(
+                    normalize_explicit_product_sales_value(
+                        &mut route,
+                        &request.current_user_message,
+                    );
+
+                    normalize_generic_named_product_performance(
+                        &mut route,
+                        &request.current_user_message,
+                    );
+
+                    normalize_explicit_calendar_month_range(
                         &mut route,
                         &request.current_user_message,
                     );
@@ -578,10 +588,7 @@ impl<'a> AgentOrchestrator<'a> {
                         &request.current_user_message,
                     );
 
-                    normalize_explicit_product_sales_value(
-                        &mut route,
-                        &request.current_user_message,
-                    );
+                    normalize_explicit_monthly_grain(&mut route, &request.current_user_message);
 
                     normalize_semantic_route(&mut route);
 
@@ -1448,6 +1455,33 @@ fn normalize_analysis_depth(route: &mut SemanticPlannerResponse, question: &str)
     }
 }
 
+fn normalize_explicit_monthly_grain(route: &mut SemanticPlannerResponse, question: &str) {
+    use crate::analytics::Dimension;
+
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    let normalized = question.to_ascii_lowercase();
+
+    if !normalized.contains("monthly") && !normalized.contains("every month") {
+        return;
+    }
+
+    /*
+     * Replace only temporal-grain dimensions.
+     * Preserve Store/Product/etc. if present.
+     */
+    plan.dimensions.retain(|dimension| {
+        !matches!(
+            dimension,
+            Dimension::Day | Dimension::Week | Dimension::Month | Dimension::Period
+        )
+    });
+
+    plan.dimensions.insert(0, Dimension::Month);
+}
+
 fn normalize_explicit_single_calendar_month(route: &mut SemanticPlannerResponse, question: &str) {
     let Some(plan) = route.plan.as_mut() else {
         return;
@@ -1583,6 +1617,110 @@ fn normalize_semantic_route(route: &mut SemanticPlannerResponse) {
     normalize_redundant_single_period_dimension(plan);
     normalize_cancellation_metric_filters(plan);
     normalize_overlapping_period_partitions(plan);
+}
+
+fn normalize_explicit_calendar_month_range(route: &mut SemanticPlannerResponse, question: &str) {
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    /*
+     * Only repair the simple case where Qwen returned one continuous
+     * analytical period. Multi-period comparisons are handled by the
+     * existing period normalizers.
+     */
+    if plan.periods.len() != 1 {
+        return;
+    }
+
+    let normalized = question.to_ascii_lowercase();
+
+    let has_range_connector = normalized.contains(" to ")
+        || normalized.contains(" through ")
+        || normalized.contains(" until ")
+        || normalized.contains(" till ")
+        || normalized.contains('–')
+        || normalized.contains('—');
+
+    if !has_range_connector {
+        return;
+    }
+
+    let year = normalized
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| token.parse::<i32>().ok())
+        .find(|year| (2000..=2100).contains(year));
+
+    let Some(year) = year else {
+        return;
+    };
+
+    const MONTHS: [(&str, &str, u32); 12] = [
+        ("january", "January", 1),
+        ("february", "February", 2),
+        ("march", "March", 3),
+        ("april", "April", 4),
+        ("may", "May", 5),
+        ("june", "June", 6),
+        ("july", "July", 7),
+        ("august", "August", 8),
+        ("september", "September", 9),
+        ("october", "October", 10),
+        ("november", "November", 11),
+        ("december", "December", 12),
+    ];
+
+    let mut mentioned_months = MONTHS
+        .into_iter()
+        .filter_map(|(needle, label, month)| {
+            normalized
+                .find(needle)
+                .map(|position| (position, label, month))
+        })
+        .collect::<Vec<_>>();
+
+    mentioned_months.sort_by_key(|(position, _, _)| *position);
+
+    /*
+     * Stay narrow. Do not reinterpret questions that mention three or
+     * more explicit months, because those may be comparisons rather
+     * than one continuous range.
+     */
+    if mentioned_months.len() != 2 {
+        return;
+    }
+
+    let (_, start_label, start_month) = mentioned_months[0];
+    let (_, end_label, end_month) = mentioned_months[1];
+
+    /*
+     * "November to February 2026" is ambiguous about the year boundary.
+     * Do not guess.
+     */
+    if start_month > end_month {
+        return;
+    }
+
+    let Some(start) = chrono::NaiveDate::from_ymd_opt(year, start_month, 1) else {
+        return;
+    };
+
+    let (end_year, next_month) = if end_month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, end_month + 1)
+    };
+
+    let Some(end_exclusive) = chrono::NaiveDate::from_ymd_opt(end_year, next_month, 1) else {
+        return;
+    };
+
+    plan.periods = vec![crate::analytics::TimePeriod {
+        label: format!("{start_label} through {end_label} {year}"),
+        start,
+        end_exclusive,
+    }];
 }
 
 fn normalize_simple_unique_customer_count(route: &mut SemanticPlannerResponse) {
@@ -1849,6 +1987,101 @@ fn normalize_explicit_product_sales_value(route: &mut SemanticPlannerResponse, q
     if plan.metrics.contains(&Metric::ProductSalesValue) {
         plan.filters.exclude_cancelled = true;
     }
+}
+
+fn normalize_generic_named_product_performance(
+    route: &mut SemanticPlannerResponse,
+    question: &str,
+) {
+    use crate::analytics::{AnalyticsDomain, Dimension, Metric};
+
+    let Some(plan) = route.plan.as_mut() else {
+        return;
+    };
+
+    if plan.domain != AnalyticsDomain::Products {
+        return;
+    }
+
+    /*
+     * This normalizer is specifically for a named product.
+     *
+     * Multi-product rankings/comparisons belong to B5.
+     */
+    let Some(product) = plan.filters.product.as_deref() else {
+        return;
+    };
+
+    if product.trim().is_empty() {
+        return;
+    }
+
+    if plan.dimensions.contains(&Dimension::Product) {
+        return;
+    }
+
+    let normalized = question.to_ascii_lowercase();
+
+    /*
+     * Only normalize generic "performance" shorthand.
+     */
+    let generic_performance_request =
+        normalized.contains("performance") || normalized.contains("performing");
+
+    if !generic_performance_request {
+        return;
+    }
+
+    /*
+     * If the user explicitly named a particular metric,
+     * preserve that request instead of expanding it to
+     * the four-metric performance contract.
+     */
+    let explicitly_requests_metric = [
+        "quantity",
+        "units sold",
+        "unit sold",
+        "orders",
+        "order count",
+        "buyers",
+        "customers",
+        "sales value",
+        "merchandise value",
+        "aov",
+        "average order value",
+        "cancelled",
+        "canceled",
+        "cancellation",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+
+    if explicitly_requests_metric {
+        return;
+    }
+
+    /*
+     * Generic named-product performance has one canonical
+     * deterministic metric contract.
+     */
+    plan.metrics = vec![
+        Metric::QuantitySold,
+        Metric::ProductOrderCount,
+        Metric::ProductUniqueCustomers,
+        Metric::ProductSalesValue,
+    ];
+
+    /*
+     * Product-performance defaults use qualifying orders:
+     * full cancellations are excluded.
+     */
+    plan.filters.exclude_cancelled = true;
+
+    /*
+     * Do not carry an invented operational/payment/delivery
+     * status restriction into a generic performance request.
+     */
+    plan.filters.status_filters.clear();
 }
 
 fn normalize_product_metric_shape(plan: &mut AnalyticsPlan) {
@@ -5245,5 +5478,220 @@ mod tests {
         normalize_explicit_single_calendar_month(&mut route, "Show performance last month.");
 
         assert_eq!(route.plan.unwrap().periods[0], original);
+    }
+    #[test]
+    fn explicit_calendar_month_range_uses_last_month_end_exclusive() {
+        use crate::analytics::{
+            AnalyticsDomain, AnalyticsFilters, Metric, TimePeriod, VisualizationIntent,
+        };
+        use chrono::NaiveDate;
+
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    /*
+                     * Simulate Qwen's incorrect output.
+                     */
+                    label: "January to July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("Sharbati Atta".to_owned()),
+                    exclude_cancelled: true,
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_explicit_calendar_month_range(
+            &mut route,
+            "Show performance of Sharbati Atta from January to July 2026",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(
+            plan.periods[0].start,
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+        );
+
+        assert_eq!(
+            plan.periods[0].end_exclusive,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
+        );
+
+        assert_eq!(plan.periods[0].label, "January through July 2026");
+    }
+    #[test]
+    fn generic_named_product_performance_uses_core_product_metrics() {
+        use crate::analytics::{
+            AnalyticsDomain, AnalyticsFilters, Metric, TimePeriod, VisualizationIntent,
+        };
+        use chrono::NaiveDate;
+
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::AverageOrderValue,
+                ],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "January through July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    exclude_cancelled: false,
+                    product: Some("Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_generic_named_product_performance(
+            &mut route,
+            "Show performance of Sharbati Atta from January to July 2026",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(
+            plan.metrics,
+            vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ]
+        );
+
+        assert!(plan.filters.exclude_cancelled);
+        assert!(plan.filters.status_filters.is_empty());
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn generic_named_product_performance_replaces_invented_cancellation_metric() {
+        use crate::analytics::{
+            AnalyticsDomain, AnalyticsFilters, Metric, TimePeriod, VisualizationIntent,
+        };
+        use chrono::NaiveDate;
+
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold, Metric::CancelledOrderCount],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "January through July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: Some(VisualizationIntent::Table),
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_generic_named_product_performance(
+            &mut route,
+            "Show performance of Sharbati Atta from January to July 2026",
+        );
+
+        let plan = route.plan.unwrap();
+
+        assert_eq!(
+            plan.metrics,
+            vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ]
+        );
+
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn explicit_named_product_metric_is_not_expanded_as_generic_performance() {
+        use crate::analytics::{AnalyticsDomain, AnalyticsFilters, Metric, TimePeriod};
+        use chrono::NaiveDate;
+
+        let mut route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::AnalyticsPlan,
+            analysis_depth: AnalysisDepth::Summary,
+            plan: Some(AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![Metric::QuantitySold],
+                dimensions: vec![],
+                periods: vec![TimePeriod {
+                    label: "July 2026".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters {
+                    product: Some("Sharbati Atta".to_owned()),
+                    ..AnalyticsFilters::default()
+                },
+                sort: None,
+                limit: None,
+                visualization: None,
+            }),
+            entity_plan: None,
+            forecast_plan: None,
+            specialized_tool: None,
+            intent: None,
+            blocked_reason: None,
+        };
+
+        normalize_generic_named_product_performance(
+            &mut route,
+            "Show quantity performance of Sharbati Atta in July 2026",
+        );
+
+        assert_eq!(route.plan.unwrap().metrics, vec![Metric::QuantitySold]);
     }
 }

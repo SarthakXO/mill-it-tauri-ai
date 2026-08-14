@@ -103,6 +103,148 @@ pub(crate) struct VariantDriverFact {
     pub(crate) percentage: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TemporalVariantContributionFacts {
+    pub(crate) buckets: Vec<TemporalVariantContributionBucketFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TemporalVariantContributionBucketFacts {
+    pub(crate) bucket: String,
+    pub(crate) variant_row_count: usize,
+    pub(crate) quantity_share_total_pct: Option<f64>,
+    pub(crate) sales_value_share_total_pct: Option<f64>,
+}
+
+pub(crate) fn enrich_temporal_variant_contribution_facts(
+    plan: &AnalyticsPlan,
+    parent: &QueryResult,
+    variants: &mut QueryResult,
+) -> Option<TemporalVariantContributionFacts> {
+    use std::collections::HashMap;
+
+    let axis_key = if plan.dimensions.contains(&Dimension::Day) {
+        "day"
+    } else if plan.dimensions.contains(&Dimension::Week) {
+        "week"
+    } else if plan.dimensions.contains(&Dimension::Month) {
+        "month"
+    } else {
+        return None;
+    };
+
+    let parent_by_bucket = parent
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let bucket = row.get(axis_key)?.as_str()?.to_owned();
+
+            Some((bucket, row))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for row in &mut variants.rows {
+        let Some(bucket) = row.get(axis_key).and_then(Value::as_str) else {
+            continue;
+        };
+
+        let Some(parent_row) = parent_by_bucket.get(bucket) else {
+            continue;
+        };
+
+        insert_percentage(
+            row,
+            QUANTITY_SHARE_PCT,
+            percentage(
+                row_number(row, "quantity_sold"),
+                row_number(parent_row, "quantity_sold"),
+            ),
+        );
+
+        insert_percentage(
+            row,
+            ORDER_PENETRATION_PCT,
+            percentage(
+                row_number(row, "product_order_count"),
+                row_number(parent_row, "product_order_count"),
+            ),
+        );
+
+        insert_percentage(
+            row,
+            BUYER_PENETRATION_PCT,
+            percentage(
+                row_number(row, "product_unique_customers"),
+                row_number(parent_row, "product_unique_customers"),
+            ),
+        );
+
+        insert_percentage(
+            row,
+            SALES_VALUE_SHARE_PCT,
+            percentage(
+                row_number(row, "product_sales_value"),
+                row_number(parent_row, "product_sales_value"),
+            ),
+        );
+    }
+
+    for column in [
+        QUANTITY_SHARE_PCT,
+        ORDER_PENETRATION_PCT,
+        BUYER_PENETRATION_PCT,
+        SALES_VALUE_SHARE_PCT,
+    ] {
+        if !variants.columns.iter().any(|existing| existing == column) {
+            variants.columns.push(column.to_owned());
+        }
+    }
+
+    let buckets = parent
+        .rows
+        .iter()
+        .filter_map(|parent_row| {
+            let bucket = parent_row.get(axis_key)?.as_str()?.to_owned();
+
+            let matching_rows = variants
+                .rows
+                .iter()
+                .filter(|row| row.get(axis_key).and_then(Value::as_str) == Some(bucket.as_str()))
+                .collect::<Vec<_>>();
+
+            if matching_rows.is_empty() {
+                return None;
+            }
+
+            Some(TemporalVariantContributionBucketFacts {
+                bucket,
+                variant_row_count: matching_rows.len(),
+
+                quantity_share_total_pct: percentage_total_from_rows(
+                    &matching_rows,
+                    QUANTITY_SHARE_PCT,
+                ),
+
+                sales_value_share_total_pct: percentage_total_from_rows(
+                    &matching_rows,
+                    SALES_VALUE_SHARE_PCT,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(TemporalVariantContributionFacts { buckets })
+}
+
+fn percentage_total_from_rows(rows: &[&Map<String, Value>], key: &str) -> Option<f64> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.iter()
+        .try_fold(0.0, |total, row| Some(total + row.get(key)?.as_f64()?))
+}
+
 pub(crate) fn enrich_variant_contribution_facts(
     parent: &QueryResult,
     variants: &mut QueryResult,

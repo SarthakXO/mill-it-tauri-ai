@@ -1,6 +1,9 @@
 use super::{
     compiler::{compile_with_product_id, CompiledAnalyticsQuery},
-    facts::{build_time_series_facts, enrich_variant_contribution_facts},
+    facts::{
+        build_time_series_facts, enrich_temporal_variant_contribution_facts,
+        enrich_variant_contribution_facts,
+    },
     insights::{summarize_metric_query_with_facts, summarize_variant_contribution_facts},
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
     product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
@@ -64,33 +67,47 @@ fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> 
         return None;
     }
 
-    // Explicit variant requests already have their requested grain.
+    // Explicit variant requests already have their grain.
     if plan.dimensions.contains(&Dimension::Variant) {
         return None;
     }
 
-    // Multi-product/grouped requests belong to the later comparison layer.
+    // Multi-product comparisons belong to B5.
     if plan.dimensions.contains(&Dimension::Product) {
         return None;
     }
 
-    /*
-     * V1 auto-expansion is intentionally limited to a single-period,
-     * non-time-series product performance snapshot.
-     *
-     * Trend/momentum variant expansion belongs to 2E-D.
-     */
-    if !plan.dimensions.is_empty() || plan.periods.len() != 1 {
+    if plan.periods.len() != 1 {
         return None;
     }
 
     /*
-     * Require a genuine performance-style multi-metric query.
-     * This prevents a simple question such as:
+     * B3:
+     *   dimensions=[]
      *
-     * "How many units did X sell?"
+     * B4-A:
+     *   dimensions=[day]
+     *   dimensions=[week]
+     *   dimensions=[month]
      *
-     * from unexpectedly expanding into a large variant table.
+     * Anything else remains unsupported by automatic
+     * variant expansion.
+     */
+    let temporal_dimension = if plan.dimensions.is_empty() {
+        None
+    } else if plan.dimensions.len() == 1
+        && matches!(
+            plan.dimensions[0],
+            Dimension::Day | Dimension::Week | Dimension::Month
+        )
+    {
+        Some(plan.dimensions[0])
+    } else {
+        return None;
+    };
+
+    /*
+     * Require genuine multi-metric product performance.
      */
     if plan.metrics.len() < 2
         || !plan
@@ -104,8 +121,18 @@ fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> 
 
     let mut variant_plan = plan.clone();
 
-    variant_plan.dimensions = vec![Dimension::Variant];
-    variant_plan.sort = Some(SortSpec::Descending);
+    variant_plan.dimensions = if let Some(temporal_dimension) = temporal_dimension {
+        vec![temporal_dimension, Dimension::Variant]
+    } else {
+        vec![Dimension::Variant]
+    };
+
+    variant_plan.sort = Some(if temporal_dimension.is_some() {
+        SortSpec::Chronological
+    } else {
+        SortSpec::Descending
+    });
+
     variant_plan.limit = None;
     variant_plan.visualization = Some(VisualizationIntent::Table);
 
@@ -346,29 +373,56 @@ pub(crate) async fn execute_semantic_plan(
          */
 
         if variant_result.row_count > 1 {
-            let contribution_facts =
-                enrich_variant_contribution_facts(&result, &mut variant_result);
+            let temporal_variant_expansion = plan.dimensions.iter().any(|dimension| {
+                matches!(
+                    dimension,
+                    Dimension::Day | Dimension::Week | Dimension::Month
+                )
+            });
 
-            #[cfg(debug_assertions)]
-            eprintln!(
-        "[analytics variant contribution]\nrequest_id={}\nvariant_count={}\nquantity_share_total_pct={:?}\nsales_value_share_total_pct={:?}",
-        request_id,
-        contribution_facts.variant_count,
-        contribution_facts.quantity_share_total_pct,
-        contribution_facts.sales_value_share_total_pct,
-    );
+            if temporal_variant_expansion {
+                let temporal_facts =
+                    enrich_temporal_variant_contribution_facts(plan, &result, &mut variant_result)
+                        .ok_or_else(|| {
+                            AgentError::InvalidPlan(
+                                "temporal variant contribution could not determine its time axis"
+                                    .to_owned(),
+                            )
+                        })?;
 
-            #[cfg(debug_assertions)]
-            eprintln!(
-        "[analytics variant drivers]\nrequest_id={}\nquantity={:?}\nsales_value={:?}\norder_penetration={:?}\nbuyer_penetration={:?}",
-        request_id,
-        contribution_facts.top_quantity_variant,
-        contribution_facts.top_sales_value_variant,
-        contribution_facts.top_order_penetration_variant,
-        contribution_facts.top_buyer_penetration_variant,
-    );
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[analytics temporal variant contribution]\nrequest_id={}\nbuckets={:?}",
+                    request_id, temporal_facts.buckets,
+                );
+            } else {
+                /*
+                 * Existing B3 snapshot behavior.
+                 */
+                let contribution_facts =
+                    enrich_variant_contribution_facts(&result, &mut variant_result);
 
-            variant_contribution_facts = Some(contribution_facts);
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant contribution]\nrequest_id={}\nvariant_count={}\nquantity_share_total_pct={:?}\nsales_value_share_total_pct={:?}",
+            request_id,
+            contribution_facts.variant_count,
+            contribution_facts.quantity_share_total_pct,
+            contribution_facts.sales_value_share_total_pct,
+        );
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant drivers]\nrequest_id={}\nquantity={:?}\nsales_value={:?}\norder_penetration={:?}\nbuyer_penetration={:?}",
+            request_id,
+            contribution_facts.top_quantity_variant,
+            contribution_facts.top_sales_value_variant,
+            contribution_facts.top_order_penetration_variant,
+            contribution_facts.top_buyer_penetration_variant,
+        );
+
+                variant_contribution_facts = Some(contribution_facts);
+            }
 
             variant_execution = Some((variant_plan, variant_compiled, variant_result));
         }
@@ -784,5 +838,50 @@ mod tests {
         };
 
         assert!(derive_variant_expansion_plan(&plan).is_none());
+    }
+    #[test]
+    fn monthly_product_performance_derives_month_variant_plan() {
+        use crate::analytics::plan::{AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod};
+        use chrono::NaiveDate;
+
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Month],
+            periods: vec![TimePeriod {
+                label: "January through July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        let variant = derive_variant_expansion_plan(&plan)
+            .expect("monthly product performance should expand");
+
+        assert_eq!(
+            variant.dimensions,
+            vec![Dimension::Month, Dimension::Variant,]
+        );
+
+        assert_eq!(variant.sort, Some(SortSpec::Chronological));
+
+        assert_eq!(variant.limit, None);
+
+        assert_eq!(variant.visualization, Some(VisualizationIntent::Table));
+
+        assert!(variant.validate().is_ok());
     }
 }
