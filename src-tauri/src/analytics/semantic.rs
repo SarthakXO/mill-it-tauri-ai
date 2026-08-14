@@ -1,6 +1,6 @@
 use super::{
     compiler::{compile_with_product_id, CompiledAnalyticsQuery},
-    facts::build_time_series_facts,
+    facts::{build_time_series_facts, enrich_variant_contribution_facts},
     insights::summarize_metric_query_with_facts,
     plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
     product_resolver::{resolve_product, ProductResolution, ResolvedProduct},
@@ -333,7 +333,7 @@ pub(crate) async fn execute_semantic_plan(
             ));
         }
 
-        let variant_result = database
+        let mut variant_result = database
             .execute_deterministic(&variant_validated, &variant_compiled.parameters)
             .await?;
 
@@ -344,6 +344,18 @@ pub(crate) async fn execute_semantic_plan(
          * is represented in the requested period.
          */
         if variant_result.row_count > 1 {
+            let contribution_facts =
+                enrich_variant_contribution_facts(&result, &mut variant_result);
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+        "[analytics variant contribution]\nrequest_id={}\nvariant_count={}\nquantity_share_total_pct={:?}\nsales_value_share_total_pct={:?}",
+        request_id,
+        contribution_facts.variant_count,
+        contribution_facts.quantity_share_total_pct,
+        contribution_facts.sales_value_share_total_pct,
+    );
+
             variant_execution = Some((variant_plan, variant_compiled, variant_result));
         }
     }

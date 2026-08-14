@@ -497,6 +497,22 @@ fn table_title(question: &str, expected_shape: &str) -> String {
 }
 
 fn humanize_key(key: &str) -> String {
+    match key.to_ascii_lowercase().as_str() {
+        "quantity_share_pct" => {
+            return "Quantity Share".to_owned();
+        }
+        "sales_value_share_pct" => {
+            return "Sales Value Share".to_owned();
+        }
+        "order_penetration_pct" => {
+            return "Order Penetration".to_owned();
+        }
+        "buyer_penetration_pct" => {
+            return "Buyer Penetration".to_owned();
+        }
+        _ => {}
+    }
+
     if key.eq_ignore_ascii_case("sku") {
         return "SKU".to_owned();
     }

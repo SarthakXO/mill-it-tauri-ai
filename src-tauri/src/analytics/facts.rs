@@ -1,7 +1,7 @@
 use super::plan::{AnalyticsPlan, Dimension, Metric};
 use crate::database::QueryResult;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub(crate) struct AnalyticalFacts {
@@ -76,6 +76,123 @@ pub(crate) fn build_time_series_facts(
         complete_bucket_count: complete_rows.len(),
         metrics,
     })
+}
+
+const QUANTITY_SHARE_PCT: &str = "quantity_share_pct";
+const SALES_VALUE_SHARE_PCT: &str = "sales_value_share_pct";
+const ORDER_PENETRATION_PCT: &str = "order_penetration_pct";
+const BUYER_PENETRATION_PCT: &str = "buyer_penetration_pct";
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VariantContributionFacts {
+    pub(crate) variant_count: usize,
+
+    /*
+     * These should be approximately 100% when the variant rows
+     * fully partition the parent product population.
+     */
+    pub(crate) quantity_share_total_pct: Option<f64>,
+    pub(crate) sales_value_share_total_pct: Option<f64>,
+}
+
+pub(crate) fn enrich_variant_contribution_facts(
+    parent: &QueryResult,
+    variants: &mut QueryResult,
+) -> VariantContributionFacts {
+    let parent_row = parent.rows.first();
+
+    let parent_quantity = parent_row.and_then(|row| row_number(row, "quantity_sold"));
+
+    let parent_order_count = parent_row.and_then(|row| row_number(row, "product_order_count"));
+
+    let parent_unique_customers =
+        parent_row.and_then(|row| row_number(row, "product_unique_customers"));
+
+    let parent_sales_value = parent_row.and_then(|row| row_number(row, "product_sales_value"));
+
+    for row in &mut variants.rows {
+        let quantity = row_number(row, "quantity_sold");
+        let order_count = row_number(row, "product_order_count");
+        let unique_customers = row_number(row, "product_unique_customers");
+        let sales_value = row_number(row, "product_sales_value");
+
+        insert_percentage(
+            row,
+            QUANTITY_SHARE_PCT,
+            percentage(quantity, parent_quantity),
+        );
+
+        insert_percentage(
+            row,
+            ORDER_PENETRATION_PCT,
+            percentage(order_count, parent_order_count),
+        );
+
+        insert_percentage(
+            row,
+            BUYER_PENETRATION_PCT,
+            percentage(unique_customers, parent_unique_customers),
+        );
+
+        insert_percentage(
+            row,
+            SALES_VALUE_SHARE_PCT,
+            percentage(sales_value, parent_sales_value),
+        );
+    }
+
+    for column in [
+        QUANTITY_SHARE_PCT,
+        ORDER_PENETRATION_PCT,
+        BUYER_PENETRATION_PCT,
+        SALES_VALUE_SHARE_PCT,
+    ] {
+        if !variants.columns.iter().any(|existing| existing == column) {
+            variants.columns.push(column.to_owned());
+        }
+    }
+
+    VariantContributionFacts {
+        variant_count: variants.row_count,
+        quantity_share_total_pct: complete_percentage_total(&variants.rows, QUANTITY_SHARE_PCT),
+        sales_value_share_total_pct: complete_percentage_total(
+            &variants.rows,
+            SALES_VALUE_SHARE_PCT,
+        ),
+    }
+}
+
+fn row_number(row: &Map<String, Value>, key: &str) -> Option<f64> {
+    row.get(key).and_then(Value::as_f64)
+}
+
+fn percentage(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+    let numerator = numerator?;
+    let denominator = denominator?;
+
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+
+    Some(numerator / denominator * 100.0)
+}
+
+fn insert_percentage(row: &mut Map<String, Value>, key: &str, percentage: Option<f64>) {
+    let value = percentage
+        .and_then(Number::from_f64)
+        .map(Value::Number)
+        .unwrap_or(Value::Null);
+
+    row.insert(key.to_owned(), value);
+}
+
+fn complete_percentage_total(rows: &[Map<String, Value>], key: &str) -> Option<f64> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.iter()
+        .try_fold(0.0, |total, row| Some(total + row.get(key)?.as_f64()?))
 }
 
 fn metric_facts(
@@ -312,5 +429,156 @@ mod tests {
 
         assert_eq!(fact.absolute_change, 10.0);
         assert_eq!(fact.percent_change, None);
+    }
+    #[test]
+    fn enriches_variant_contribution_and_penetration() {
+        let parent_row = Map::from_iter([
+            ("quantity_sold".to_owned(), Value::from(100)),
+            ("product_order_count".to_owned(), Value::from(10)),
+            ("product_unique_customers".to_owned(), Value::from(8)),
+            ("product_sales_value".to_owned(), Value::from(1000.0)),
+        ]);
+
+        let parent = QueryResult {
+            columns: vec![
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![parent_row.clone()],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let first = Map::from_iter([
+            ("variant_id".to_owned(), Value::from("variant_a")),
+            ("variant_title".to_owned(), Value::from("Variant A")),
+            ("quantity_sold".to_owned(), Value::from(60)),
+            ("product_order_count".to_owned(), Value::from(7)),
+            ("product_unique_customers".to_owned(), Value::from(6)),
+            ("product_sales_value".to_owned(), Value::from(700.0)),
+        ]);
+
+        let second = Map::from_iter([
+            ("variant_id".to_owned(), Value::from("variant_b")),
+            ("variant_title".to_owned(), Value::from("Variant B")),
+            ("quantity_sold".to_owned(), Value::from(40)),
+            ("product_order_count".to_owned(), Value::from(6)),
+            ("product_unique_customers".to_owned(), Value::from(5)),
+            ("product_sales_value".to_owned(), Value::from(300.0)),
+        ]);
+
+        let mut variants = QueryResult {
+            columns: vec![
+                "variant_id".to_owned(),
+                "variant_title".to_owned(),
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![first, second],
+            row_count: 2,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let facts = enrich_variant_contribution_facts(&parent, &mut variants);
+
+        let first = &variants.rows[0];
+        let second = &variants.rows[1];
+
+        assert_close(first["quantity_share_pct"].as_f64().unwrap(), 60.0);
+
+        assert_close(second["quantity_share_pct"].as_f64().unwrap(), 40.0);
+
+        assert_close(first["sales_value_share_pct"].as_f64().unwrap(), 70.0);
+
+        assert_close(second["sales_value_share_pct"].as_f64().unwrap(), 30.0);
+
+        /*
+         * Penetration is intentionally non-additive.
+         *
+         * A parent order/customer may contain multiple variants.
+         */
+        assert_close(first["order_penetration_pct"].as_f64().unwrap(), 70.0);
+
+        assert_close(second["order_penetration_pct"].as_f64().unwrap(), 60.0);
+
+        assert_close(first["buyer_penetration_pct"].as_f64().unwrap(), 75.0);
+
+        assert_close(second["buyer_penetration_pct"].as_f64().unwrap(), 62.5);
+
+        assert_close(facts.quantity_share_total_pct.unwrap(), 100.0);
+
+        assert_close(facts.sales_value_share_total_pct.unwrap(), 100.0);
+
+        /*
+         * B3 must never mutate/recalculate the parent result.
+         */
+        assert_eq!(parent.rows[0], parent_row);
+    }
+
+    #[test]
+    fn zero_parent_denominators_produce_null_percentages() {
+        let parent = QueryResult {
+            columns: vec![
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![Map::from_iter([
+                ("quantity_sold".to_owned(), Value::from(0)),
+                ("product_order_count".to_owned(), Value::from(0)),
+                ("product_unique_customers".to_owned(), Value::from(0)),
+                ("product_sales_value".to_owned(), Value::from(0)),
+            ])],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let mut variants = QueryResult {
+            columns: vec![
+                "variant_id".to_owned(),
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![Map::from_iter([
+                ("variant_id".to_owned(), Value::from("variant_a")),
+                ("quantity_sold".to_owned(), Value::from(0)),
+                ("product_order_count".to_owned(), Value::from(0)),
+                ("product_unique_customers".to_owned(), Value::from(0)),
+                ("product_sales_value".to_owned(), Value::from(0)),
+            ])],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        enrich_variant_contribution_facts(&parent, &mut variants);
+
+        let row = &variants.rows[0];
+
+        assert!(row["quantity_share_pct"].is_null());
+        assert!(row["sales_value_share_pct"].is_null());
+        assert!(row["order_penetration_pct"].is_null());
+        assert!(row["buyer_penetration_pct"].is_null());
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {expected}, got {actual}"
+        );
     }
 }
