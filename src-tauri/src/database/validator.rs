@@ -13,6 +13,8 @@ const MAX_SQL_LENGTH: usize = 20_000;
 const ALLOWED_TABLES: &[&str] = &[
     "order",
     "line_item",
+    "product_category",
+    "product_category_product",
     "fulfillment",
     "payment",
     "customer",
@@ -599,5 +601,21 @@ mod tests {
             &["first_name", "phone"]
         )
         .is_err());
+    }
+
+    #[test]
+    fn accepts_verified_product_category_relations() {
+        validate_sql(
+            r#"
+        SELECT
+            pcp.product_id,
+            pc.id AS category_id,
+            pc.parent_category_id
+        FROM product_category_product AS pcp
+        JOIN product_category AS pc
+            ON pc.id = pcp.product_category_id
+        "#,
+        )
+        .expect("verified product-category relations should be allowed for read-only analytics");
     }
 }

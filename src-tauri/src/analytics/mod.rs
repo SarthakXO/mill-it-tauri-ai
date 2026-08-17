@@ -1,4 +1,6 @@
 mod compiler;
+mod customer;
+mod customer_plan;
 mod customers;
 mod dates;
 mod entities;
@@ -19,6 +21,12 @@ mod statistics;
 mod tools;
 mod types;
 
+pub(crate) use customer::{execute_customer_analysis_plan, CustomerAnalysisExecution};
+pub(crate) use customer_plan::{
+    CustomerAnalysis, CustomerAnalysisPlan, CustomerPlanValidationError,
+    CustomerProgressionSubject, CustomerReorderGrain, CustomerSegment,
+    LOYAL_CUSTOMER_LOOKBACK_MONTHS, LOYAL_CUSTOMER_MIN_ORDERS,
+};
 pub(crate) use dates::latest_complete_business_date;
 pub(crate) use entities::execute_entity_plan;
 pub(crate) use forecast_store::ForecastStore;
