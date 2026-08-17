@@ -1299,74 +1299,74 @@ fn semantic_planner_schema() -> Value {
     });
 
     let customer_plan_schema = json!({
-        "type": "object",
-        "additionalProperties": false,
+            "type": "object",
+            "additionalProperties": false,
 
-        "properties": {
-            "period": period_schema.clone(),
+            "properties": {
+                "period": period_schema.clone(),
 
-            /*
-             * Only the currently executable customer segment is
-             * exposed to Qwen.
-             */
-            "segment": {
-                "type": "string",
-                "enum": [
-                    "loyal"
-                ]
-            },
-
-            /*
-             * CustomerAnalysis is internally a tagged Rust enum.
-             *
-             * At this stage expose only:
-             *
-             * PurchaseProgression {
-             *     subject: Category,
-             *     max_purchase_number
-             * }
-             */
-            "analysis": {
-                "type": "object",
-                "additionalProperties": false,
-
-                "properties": {
-                   "type": {
-    "type": "string",
-    "enum": [
-        "purchase_progression",
-        "purchase_transition"
-    ]
-},
-
-                    "subject": {
-                        "type": "string",
-                        "enum": [
-                            "category"
-                        ]
-                    },
-
-                    "max_purchase_number": {
-                        "type": "integer",
-                        "minimum": 2,
-                        "maximum": 20
-                    }
+                /*
+                 * Only the currently executable customer segment is
+                 * exposed to Qwen.
+                 */
+                "segment": {
+                    "type": "string",
+                    "enum": [
+                        "loyal"
+                    ]
                 },
 
-                "required": [
-                    "type",
-                    "subject",
-                    "max_purchase_number"
-                ]
-            }
-        },
+                /*
+                 * CustomerAnalysis is internally a tagged Rust enum.
+                 *
+                 * At this stage expose only:
+                 *
+                 * PurchaseProgression {
+                 *     subject: Category,
+                 *     max_purchase_number
+                 * }
+                 */
+                "analysis": {
+                    "type": "object",
+                    "additionalProperties": false,
 
-        "required": [
-            "period",
-            "segment",
-            "analysis"
+                    "properties": {
+                       "type": {
+        "type": "string",
+        "enum": [
+            "purchase_progression",
+            "purchase_transition"
         ]
-    });
+    },
+
+                        "subject": {
+                            "type": "string",
+                            "enum": [
+                                "category"
+                            ]
+                        },
+
+                        "max_purchase_number": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "maximum": 20
+                        }
+                    },
+
+                    "required": [
+                        "type",
+                        "subject",
+                        "max_purchase_number"
+                    ]
+                }
+            },
+
+            "required": [
+                "period",
+                "segment",
+                "analysis"
+            ]
+        });
 
     let forecast_plan_schema = json!({
         "type": "object",

@@ -92,10 +92,18 @@ pub(crate) async fn execute_customer_analysis_plan(
 
     let summary_duration_ms = summary_started.elapsed().as_millis();
 
+    let response_context = match &plan.analysis {
+        CustomerAnalysis::PurchaseProgression { .. } => "customer purchase progression",
+
+        CustomerAnalysis::PurchaseTransition { .. } => "customer category transitions",
+
+        _ => "customer analysis",
+    };
+
     let mut response = AgentResponse::from_query(
         answer,
         question,
-        "customer purchase progression",
+        response_context,
         compiled.expected_shape,
         &result,
         None,
@@ -185,8 +193,7 @@ fn compile_customer_analysis(
 
     if plan.segment != CustomerSegment::Loyal {
         return Err(
-            "customer purchase progression currently requires the loyal customer segment"
-                .to_owned(),
+            "customer purchase analysis currently requires the loyal customer segment".to_owned(),
         );
     }
 
@@ -745,6 +752,48 @@ transition_population AS (
         previous.purchase_number,
         current.purchase_number
 ),
+from_category_population AS (
+    /*
+     * Conditional transition denominator.
+     *
+     * Count customers who:
+     * 1. bought from_category at purchase N
+     * 2. actually reached purchase N+1
+     *
+     * This lets us answer:
+     *
+     * "Of customers who bought Atta at purchase 1,
+     *  what percentage bought Bakery at purchase 2?"
+     */
+    SELECT
+        previous.purchase_number
+            AS from_purchase_number,
+
+        previous.category
+            AS from_category,
+
+        COUNT(
+            DISTINCT previous.customer_id
+        )::bigint
+            AS customers_with_from_category
+
+    FROM order_category_incidence AS previous
+
+    JOIN sequenced_orders AS next_order
+        ON next_order.customer_id =
+            previous.customer_id
+
+        AND next_order.purchase_number =
+            previous.purchase_number + 1
+
+    WHERE
+        next_order.purchase_number <=
+            ($4::bigint)
+
+    GROUP BY
+        previous.purchase_number,
+        previous.category
+),
 
 category_transition_incidence AS (
     /*
@@ -825,8 +874,19 @@ SELECT
 
     tp.customers_reaching_transition,
 
+    fcp.customers_with_from_category,
+
     tc.customers_with_transition,
 
+    /*
+     * Share of the entire customer population that
+     * reached this purchase-to-purchase transition.
+     *
+     * Example:
+     * 120 Atta -> Bakery customers
+     * / 1000 customers reaching purchase 1 -> 2
+     * = 12%
+     */
     ROUND(
         (
             100.0
@@ -837,7 +897,28 @@ SELECT
             )
         ),
         2
-    ) AS transition_penetration_pct
+    ) AS transition_penetration_pct,
+
+    /*
+     * Conditional transition rate.
+     *
+     * Example:
+     * 120 Atta -> Bakery customers
+     * / 300 customers who bought Atta at purchase 1
+     * and reached purchase 2
+     * = 40%
+     */
+    ROUND(
+        (
+            100.0
+            * tc.customers_with_transition::numeric
+            / NULLIF(
+                fcp.customers_with_from_category::numeric,
+                0
+            )
+        ),
+        2
+    ) AS transition_rate_pct
 
 FROM transition_counts AS tc
 
@@ -847,6 +928,13 @@ JOIN transition_population AS tp
 
     AND tp.to_purchase_number =
         tc.to_purchase_number
+
+JOIN from_category_population AS fcp
+    ON fcp.from_purchase_number =
+        tc.from_purchase_number
+
+    AND fcp.from_category =
+        tc.from_category
 
 ORDER BY
     tc.from_purchase_number ASC,
@@ -933,14 +1021,29 @@ fn summarize_category_transitions(result: &QueryResult, max_purchase_number: u32
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
 
+        let transition_rate = top_row
+            .get("transition_rate_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        let from_population = top_row
+            .get("customers_with_from_category")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
         transition_lines.push(format!(
-            "{} → {}: {} → {} ({} customers, {:.2}%)",
+            "{} → {}: {} → {} \
+({} customers; {:.2}% of the full transition cohort; \
+{:.2}% of the {} customers starting in {})",
             ordinal_label(from_purchase),
             ordinal_label(to_purchase),
             from_category,
             to_category,
             customers,
             penetration,
+            transition_rate,
+            from_population,
+            from_category,
         ));
     }
 
@@ -954,8 +1057,8 @@ fn summarize_category_transitions(result: &QueryResult, max_purchase_number: u32
     }
 
     answer.push_str(
-        "\n\nTransition percentages are category-pair incidence, not mutually exclusive customer shares. Multi-category baskets can contribute to several category pairs.",
-    );
+    "\n\nTransition penetration is the share of all customers reaching that purchase-to-purchase stage. Transition rate is conditional on customers who bought the starting category and reached the next purchase. Because baskets can contain multiple categories, category-pair transitions are incidence relationships and are not mutually exclusive.",
+);
 
     answer
 }
@@ -1340,6 +1443,11 @@ mod tests {
         assert!(normalized.contains("customers_with_transition"));
 
         assert!(normalized.contains("transition_penetration_pct"));
+        assert!(normalized.contains("customers_with_from_category"));
+
+        assert!(normalized.contains("transition_rate_pct"));
+
+        assert!(normalized.contains("from_category_population"));
     }
     #[test]
     fn category_transition_sql_passes_read_only_ast_validation() {
@@ -1371,5 +1479,107 @@ mod tests {
                 "customer transition SQL must not contain {prohibited}",
             );
         }
+    }
+    #[test]
+    fn category_transition_rate_uses_starting_category_population() {
+        let compiled = compile_customer_analysis(&loyal_category_transition_plan())
+            .expect("category transition should compile");
+
+        let normalized = compiled
+            .sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+
+        assert!(normalized.contains(
+        "tc.customers_with_transition::numeric / nullif( fcp.customers_with_from_category::numeric, 0 )"
+    ));
+
+        assert!(normalized.contains("as transition_rate_pct"));
+
+        /*
+         * The starting-category denominator must include
+         * only customers who actually reached N+1.
+         */
+        assert!(normalized.contains("next_order.purchase_number = previous.purchase_number + 1"));
+    }
+    #[test]
+    fn category_transition_summary_reports_both_transition_percentages() {
+        let mut row = serde_json::Map::new();
+
+        row.insert(
+            "from_purchase_number".to_owned(),
+            serde_json::Value::from(1),
+        );
+
+        row.insert("to_purchase_number".to_owned(), serde_json::Value::from(2));
+
+        row.insert(
+            "from_category".to_owned(),
+            serde_json::Value::from("Atta & Daliya"),
+        );
+
+        row.insert("to_category".to_owned(), serde_json::Value::from("Bakery"));
+
+        row.insert(
+            "customers_reaching_transition".to_owned(),
+            serde_json::Value::from(1000),
+        );
+
+        row.insert(
+            "customers_with_from_category".to_owned(),
+            serde_json::Value::from(300),
+        );
+
+        row.insert(
+            "customers_with_transition".to_owned(),
+            serde_json::Value::from(120),
+        );
+
+        row.insert(
+            "transition_penetration_pct".to_owned(),
+            serde_json::Value::from(12.0),
+        );
+
+        row.insert(
+            "transition_rate_pct".to_owned(),
+            serde_json::Value::from(40.0),
+        );
+
+        let result = QueryResult {
+            columns: vec![
+                "from_purchase_number".to_owned(),
+                "to_purchase_number".to_owned(),
+                "from_category".to_owned(),
+                "to_category".to_owned(),
+                "customers_reaching_transition".to_owned(),
+                "customers_with_from_category".to_owned(),
+                "customers_with_transition".to_owned(),
+                "transition_penetration_pct".to_owned(),
+                "transition_rate_pct".to_owned(),
+            ],
+
+            rows: vec![row],
+
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let summary = summarize_category_transitions(&result, 3);
+
+        assert!(summary.contains("Atta & Daliya"));
+
+        assert!(summary.contains("Bakery"));
+
+        assert!(summary.contains("120 customers"));
+
+        assert!(summary.contains("12.00%"));
+
+        assert!(summary.contains("40.00%"));
+
+        assert!(summary.contains("300 customers"));
     }
 }
