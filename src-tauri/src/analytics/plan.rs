@@ -5,6 +5,7 @@ use std::{error::Error, fmt};
 pub(crate) const MAX_PERIODS: usize = 24;
 pub(crate) const MAX_PLAN_LIMIT: u32 = 100;
 pub(crate) const MAX_METRICS: usize = 6;
+pub(crate) const MAX_PRODUCTS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -19,8 +20,13 @@ pub(crate) enum AnalyticsDomain {
 pub(crate) enum Metric {
     OrderCount,
     UniqueCustomers,
+
     QuantitySold,
+    ProductOrderCount,
+    ProductUniqueCustomers,
+    ProductSalesValue,
     UniqueVariants,
+
     OrderValue,
     AverageOrderValue,
     AverageItemQuantityPerOrder,
@@ -40,6 +46,9 @@ impl Metric {
             Self::AverageItemQuantityPerOrder => "average_item_quantity_per_order",
             Self::CancelledOrderCount => "cancelled_order_count",
             Self::CancellationRate => "cancellation_rate",
+            Self::ProductOrderCount => "product_order_count",
+            Self::ProductUniqueCustomers => "product_unique_customers",
+            Self::ProductSalesValue => "product_sales_value",
         }
     }
 
@@ -86,7 +95,21 @@ pub(crate) struct AnalyticsFilters {
     pub(crate) exclude_cancelled: bool,
     pub(crate) status_filters: Vec<StatusFilter>,
     pub(crate) store_id: Option<String>,
+
+    /*
+     * Single named-product subject.
+     *
+     * Existing B3/B4 path.
+     */
     pub(crate) product: Option<String>,
+
+    /*
+     * Explicit multi-product comparison set.
+     *
+     * B5 only. One product continues to use `product`.
+     */
+    pub(crate) products: Vec<String>,
+
     pub(crate) variant_id: Option<String>,
 }
 
@@ -235,7 +258,11 @@ fn validate_domain_metric(
             | (AnalyticsDomain::Customers, Metric::UniqueCustomers)
             | (
                 AnalyticsDomain::Products,
-                Metric::QuantitySold | Metric::UniqueVariants
+                Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
+                    | Metric::UniqueVariants
             )
     );
     valid.then_some(()).ok_or(PlanValidationError::DomainMetric)
@@ -284,7 +311,10 @@ fn validate_dimensions(
                 | Dimension::Period
                 | Dimension::Store
         ),
-        Metric::QuantitySold => !matches!(
+        Metric::QuantitySold
+        | Metric::ProductOrderCount
+        | Metric::ProductUniqueCustomers
+        | Metric::ProductSalesValue => !matches!(
             dimension,
             Dimension::Day
                 | Dimension::Week
@@ -337,11 +367,98 @@ fn validate_filters(plan: &MetricQueryPlan) -> Result<(), PlanValidationError> {
     {
         return Err(PlanValidationError::UnsupportedFilter);
     }
-    if (plan.filters.product.is_some() || plan.filters.variant_id.is_some())
-        && plan
-            .metrics
+
+    let has_multi_product_filter = !plan.filters.products.is_empty();
+
+    if has_multi_product_filter {
+        /*
+         * `products` represents an explicit comparison set.
+         *
+         * A single product must continue to use `product`.
+         */
+        if plan.filters.products.len() < 2 || plan.filters.products.len() > MAX_PRODUCTS {
+            return Err(PlanValidationError::InvalidProductFilter);
+        }
+
+        /*
+         * Reject blank / unreasonably large product mentions.
+         *
+         * Do not restrict punctuation here because legitimate catalogue
+         * names may contain '/', '-', apostrophes, etc.
+         */
+        if plan
+            .filters
+            .products
             .iter()
-            .any(|metric| !matches!(metric, Metric::QuantitySold | Metric::UniqueVariants))
+            .any(|product| product.trim().is_empty() || product.trim().len() > 120)
+        {
+            return Err(PlanValidationError::InvalidProductFilter);
+        }
+
+        /*
+         * Duplicate detection is case-insensitive and ignores surrounding
+         * whitespace. Rust must not compare the same product twice merely
+         * because Qwen emitted slightly different casing.
+         */
+        let mut normalized_products = plan
+            .filters
+            .products
+            .iter()
+            .map(|product| product.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        normalized_products.sort();
+        normalized_products.dedup();
+
+        if normalized_products.len() != plan.filters.products.len() {
+            return Err(PlanValidationError::InvalidProductFilter);
+        }
+
+        /*
+         * Single-product, multi-product and explicit-variant selectors are
+         * mutually exclusive.
+         */
+        if plan.filters.product.is_some() || plan.filters.variant_id.is_some() {
+            return Err(PlanValidationError::InvalidProductFilter);
+        }
+
+        /*
+         * B5 comparison sets are products-domain/product-grain only.
+         */
+        if plan.domain != AnalyticsDomain::Products
+            || !plan.dimensions.contains(&Dimension::Product)
+            || plan.dimensions.contains(&Dimension::Variant)
+        {
+            return Err(PlanValidationError::InvalidProductFilter);
+        }
+
+        /*
+         * B5 starts with the four canonical product-performance metrics.
+         * UniqueVariants and order-grain metrics are deliberately excluded.
+         */
+        if plan.metrics.iter().any(|metric| {
+            !matches!(
+                metric,
+                Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
+            )
+        }) {
+            return Err(PlanValidationError::UnsupportedFilter);
+        }
+    }
+    if (plan.filters.product.is_some() || plan.filters.variant_id.is_some())
+        && plan.metrics.iter().any(|metric| {
+            !matches!(
+                metric,
+                Metric::QuantitySold
+                    | Metric::ProductOrderCount
+                    | Metric::ProductUniqueCustomers
+                    | Metric::ProductSalesValue
+                    | Metric::UniqueVariants
+            )
+        })
     {
         return Err(PlanValidationError::UnsupportedFilter);
     }
@@ -387,6 +504,7 @@ pub(crate) enum PlanValidationError {
     DomainMetric,
     UnsupportedDimension,
     UnsupportedFilter,
+    InvalidProductFilter,
     InvalidStatusFilter,
     ContradictoryCancellationFilter,
     OverlappingPeriods,
@@ -407,6 +525,9 @@ impl fmt::Display for PlanValidationError {
             Self::DomainMetric => "the metric is not supported by the selected domain",
             Self::UnsupportedDimension => "the metric/dimension combination is unsupported",
             Self::UnsupportedFilter => "the filter is unsupported for this metric",
+            Self::InvalidProductFilter => {
+    "multi-product comparisons require between two and ten unique non-empty products, product grain, and no simultaneous single-product or variant selector"
+}
             Self::InvalidStatusFilter => "a status filter is empty, too large, or unsafe",
             Self::OverlappingPeriods => {
     "comparison periods must not overlap; use one distinct non-overlapping interval for each comparison period"
@@ -427,6 +548,27 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn multi_product_plan(products: Vec<&str>) -> AnalyticsPlan {
+        AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Product],
+            periods: vec![period("July 2026", (2026, 7, 1), (2026, 8, 1))],
+            filters: AnalyticsFilters {
+                exclude_cancelled: true,
+                products: products.into_iter().map(str::to_owned).collect(),
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        }
+    }
 
     fn period(label: &str, start: (i32, u32, u32), end: (i32, u32, u32)) -> TimePeriod {
         TimePeriod {
@@ -575,6 +717,110 @@ mod tests {
             limit: None,
             visualization: Some(VisualizationIntent::Bar),
         };
+
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn multi_product_filter_accepts_explicit_comparison_set() {
+        let plan = multi_product_plan(vec!["Sharbati Atta", "Khapli Emmer", "Multigrain Atta"]);
+
+        assert!(plan.validate().is_ok());
+    }
+    #[test]
+    fn multi_product_filter_rejects_single_product_list() {
+        let plan = multi_product_plan(vec!["Sharbati Atta"]);
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_rejects_blank_product_name() {
+        let plan = multi_product_plan(vec!["Sharbati Atta", "   "]);
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+
+    #[test]
+    fn multi_product_filter_rejects_more_than_ten_products() {
+        let plan = multi_product_plan(vec![
+            "Product 1",
+            "Product 2",
+            "Product 3",
+            "Product 4",
+            "Product 5",
+            "Product 6",
+            "Product 7",
+            "Product 8",
+            "Product 9",
+            "Product 10",
+            "Product 11",
+        ]);
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_rejects_case_insensitive_duplicates() {
+        let plan = multi_product_plan(vec!["Sharbati Atta", "  sharbati atta  "]);
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_rejects_single_and_multi_product_selectors_together() {
+        let mut plan = multi_product_plan(vec!["Sharbati Atta", "Khapli Emmer"]);
+
+        plan.filters.product = Some("Sharbati Atta".to_owned());
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_rejects_variant_selector() {
+        let mut plan = multi_product_plan(vec!["Sharbati Atta", "Khapli Emmer"]);
+
+        plan.filters.variant_id = Some("variant_test".to_owned());
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_requires_product_dimension() {
+        let mut plan = multi_product_plan(vec!["Sharbati Atta", "Khapli Emmer"]);
+
+        plan.dimensions.clear();
+
+        assert_eq!(
+            plan.validate(),
+            Err(PlanValidationError::InvalidProductFilter)
+        );
+    }
+    #[test]
+    fn multi_product_filter_allows_month_and_product_dimensions() {
+        let mut plan = multi_product_plan(vec!["Sharbati Atta", "Khapli Emmer"]);
+
+        plan.dimensions = vec![Dimension::Month, Dimension::Product];
+
+        plan.periods = vec![TimePeriod {
+            label: "May through July 2026".to_owned(),
+            start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        }];
+
+        plan.sort = Some(SortSpec::Chronological);
 
         assert!(plan.validate().is_ok());
     }

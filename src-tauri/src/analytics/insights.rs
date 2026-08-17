@@ -1,4 +1,10 @@
-use super::plan::{AnalyticsPlan, Dimension, Metric};
+use super::{
+    facts::{
+        AnalyticalFacts, MetricFacts, TemporalVariantMixShiftDriverFacts, VariantContributionFacts,
+        VariantDriverFact, VariantMixShiftDriverFact,
+    },
+    plan::{AnalyticsPlan, Dimension, Metric},
+};
 use crate::database::QueryResult;
 use chrono::{Datelike, Duration};
 use serde_json::Value;
@@ -13,12 +19,487 @@ pub(crate) fn summarize_metric_query(plan: &AnalyticsPlan, result: &QueryResult)
     if plan.dimensions.contains(&Dimension::Variant)
         || plan.dimensions.contains(&Dimension::Product)
     {
-        return ranking_summary(plan, result);
+        return if plan.metrics.len() > 1 {
+            multi_metric_ranking_summary(plan, result)
+        } else {
+            ranking_summary(plan, result)
+        };
     }
+    if plan.dimensions.is_empty() && plan.metrics.len() > 1 && result.row_count == 1 {
+        return multi_metric_scalar_summary(plan, result);
+    }
+
     if plan.metrics.len() > 1 {
         return multi_metric_summary(plan, result);
     }
     comparison_summary(plan, result, plan.metrics[0])
+}
+
+pub(crate) fn summarize_variant_contribution_facts(
+    facts: &VariantContributionFacts,
+) -> Option<String> {
+    if facts.variant_count < 2 {
+        return None;
+    }
+
+    let mut sentences = Vec::new();
+
+    append_quantity_and_sales_driver(
+        &mut sentences,
+        facts.top_quantity_variant.as_ref(),
+        facts.top_sales_value_variant.as_ref(),
+    );
+
+    append_order_and_buyer_driver(
+        &mut sentences,
+        facts.top_order_penetration_variant.as_ref(),
+        facts.top_buyer_penetration_variant.as_ref(),
+    );
+
+    if sentences.is_empty() {
+        None
+    } else {
+        Some(format!("Variant drivers: {}", sentences.join(" ")))
+    }
+}
+
+pub(crate) fn summarize_temporal_variant_mix_shift_driver_facts(
+    facts: &TemporalVariantMixShiftDriverFacts,
+) -> Option<String> {
+    let latest = facts.transitions.last()?;
+
+    let from_bucket = format_variant_trend_bucket(&latest.from_bucket);
+
+    let to_bucket = format_variant_trend_bucket(&latest.to_bucket);
+
+    let mut sections = Vec::new();
+
+    if let Some(section) = format_variant_shift_pair(
+        "Quantity mix",
+        latest.largest_quantity_mix_gain.as_ref(),
+        latest.largest_quantity_mix_loss.as_ref(),
+    ) {
+        sections.push(section);
+    }
+
+    if let Some(section) = format_variant_shift_pair(
+        "Sales-value mix",
+        latest.largest_sales_mix_gain.as_ref(),
+        latest.largest_sales_mix_loss.as_ref(),
+    ) {
+        sections.push(section);
+    }
+
+    if let Some(section) = format_variant_shift_pair(
+        "Order penetration",
+        latest.largest_order_penetration_gain.as_ref(),
+        latest.largest_order_penetration_loss.as_ref(),
+    ) {
+        sections.push(section);
+    }
+
+    if let Some(section) = format_variant_shift_pair(
+        "Buyer penetration",
+        latest.largest_buyer_penetration_gain.as_ref(),
+        latest.largest_buyer_penetration_loss.as_ref(),
+    ) {
+        sections.push(section);
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Latest variant movement, {from_bucket} to {to_bucket}: {}",
+        sections.join(" ")
+    ))
+}
+
+fn format_variant_shift_pair(
+    label: &str,
+    gain: Option<&VariantMixShiftDriverFact>,
+    loss: Option<&VariantMixShiftDriverFact>,
+) -> Option<String> {
+    match (gain, loss) {
+        (Some(gain), Some(loss)) => Some(format!(
+            "{label}: {} gained the most, moving from {:.1}% to {:.1}% ({:+.1} pp), while {} declined the most, moving from {:.1}% to {:.1}% ({:+.1} pp).",
+            gain.variant_title,
+            gain.previous_pct,
+            gain.current_pct,
+            gain.change_pp,
+            loss.variant_title,
+            loss.previous_pct,
+            loss.current_pct,
+            loss.change_pp,
+        )),
+
+        (Some(gain), None) => Some(format!(
+            "{label}: {} gained the most, moving from {:.1}% to {:.1}% ({:+.1} pp).",
+            gain.variant_title,
+            gain.previous_pct,
+            gain.current_pct,
+            gain.change_pp,
+        )),
+
+        (None, Some(loss)) => Some(format!(
+            "{label}: {} declined the most, moving from {:.1}% to {:.1}% ({:+.1} pp).",
+            loss.variant_title,
+            loss.previous_pct,
+            loss.current_pct,
+            loss.change_pp,
+        )),
+
+        (None, None) => None,
+    }
+}
+
+fn format_variant_trend_bucket(bucket: &str) -> String {
+    use chrono::NaiveDate;
+
+    NaiveDate::parse_from_str(bucket, "%Y-%m-%d")
+        .map(|date| date.format("%B %Y").to_string())
+        .unwrap_or_else(|_| bucket.to_owned())
+}
+
+fn append_quantity_and_sales_driver(
+    sentences: &mut Vec<String>,
+    quantity: Option<&VariantDriverFact>,
+    sales: Option<&VariantDriverFact>,
+) {
+    match (quantity, sales) {
+        (Some(quantity), Some(sales)) if quantity.variant_id == sales.variant_id => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold and sales-value contribution at {:.1}%.",
+                quantity.variant_title,
+                quantity.percentage,
+                sales.percentage,
+            ));
+        }
+
+        (Some(quantity), Some(sales)) => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold.",
+                quantity.variant_title, quantity.percentage,
+            ));
+
+            sentences.push(format!(
+                "{} led sales-value contribution at {:.1}%.",
+                sales.variant_title, sales.percentage,
+            ));
+        }
+
+        (Some(quantity), None) => {
+            sentences.push(format!(
+                "{} led quantity contribution at {:.1}% of units sold.",
+                quantity.variant_title, quantity.percentage,
+            ));
+        }
+
+        (None, Some(sales)) => {
+            sentences.push(format!(
+                "{} led sales-value contribution at {:.1}%.",
+                sales.variant_title, sales.percentage,
+            ));
+        }
+
+        (None, None) => {}
+    }
+}
+
+fn append_order_and_buyer_driver(
+    sentences: &mut Vec<String>,
+    orders: Option<&VariantDriverFact>,
+    buyers: Option<&VariantDriverFact>,
+) {
+    match (orders, buyers) {
+        (Some(orders), Some(buyers)) if orders.variant_id == buyers.variant_id => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}% and the highest buyer penetration at {:.1}%.",
+                orders.variant_title,
+                orders.percentage,
+                buyers.percentage,
+            ));
+        }
+
+        (Some(orders), Some(buyers)) => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}%.",
+                orders.variant_title, orders.percentage,
+            ));
+
+            sentences.push(format!(
+                "{} had the highest buyer penetration at {:.1}%.",
+                buyers.variant_title, buyers.percentage,
+            ));
+        }
+
+        (Some(orders), None) => {
+            sentences.push(format!(
+                "{} had the highest order penetration at {:.1}%.",
+                orders.variant_title, orders.percentage,
+            ));
+        }
+
+        (None, Some(buyers)) => {
+            sentences.push(format!(
+                "{} had the highest buyer penetration at {:.1}%.",
+                buyers.variant_title, buyers.percentage,
+            ));
+        }
+
+        (None, None) => {}
+    }
+}
+
+pub(crate) fn summarize_metric_query_with_facts(
+    plan: &AnalyticsPlan,
+    result: &QueryResult,
+    analytical_facts: Option<&AnalyticalFacts>,
+) -> String {
+    let is_time_series = plan.dimensions.iter().any(|dimension| {
+        matches!(
+            dimension,
+            Dimension::Day | Dimension::Week | Dimension::Month
+        )
+    });
+
+    if !is_time_series {
+        return summarize_metric_query(plan, result);
+    }
+
+    let Some(facts) = analytical_facts else {
+        return summarize_metric_query(plan, result);
+    };
+
+    if facts.complete_bucket_count == 0 {
+        return format!(
+            "The returned series contains no complete buckets suitable for analytical comparison.{}",
+            partial_bucket_note(facts)
+        );
+    }
+
+    if plan.metrics.len() > 1 {
+        return multi_metric_fact_summary(plan, facts);
+    }
+
+    let Some(metric) = plan.metrics.first().copied() else {
+        return summarize_metric_query(plan, result);
+    };
+
+    let Some(metric_facts) = facts
+        .metrics
+        .iter()
+        .find(|facts| facts.metric == metric.value_key())
+    else {
+        return summarize_metric_query(plan, result);
+    };
+
+    single_metric_fact_summary(metric, metric_facts, facts)
+}
+
+fn single_metric_fact_summary(
+    metric: Metric,
+    metric_facts: &MetricFacts,
+    facts: &AnalyticalFacts,
+) -> String {
+    let note = partial_bucket_note(facts);
+
+    let Some(first) = metric_facts.first_complete.as_ref() else {
+        return format!(
+            "No complete {} buckets were available for analysis.{}",
+            facts.complete_bucket_count, note
+        );
+    };
+
+    let Some(last) = metric_facts.last_complete.as_ref() else {
+        return format!(
+            "{} was {} for the only complete bucket, {}.{}",
+            metric_label(metric),
+            format_value(metric, first.value),
+            first.label,
+            note
+        );
+    };
+
+    if facts.complete_bucket_count == 1 {
+        return format!(
+            "{} was {} for the only complete bucket, {}.{}",
+            metric_label(metric),
+            format_value(metric, first.value),
+            first.label,
+            note
+        );
+    }
+
+    let overall = metric_facts
+        .overall_change
+        .as_ref()
+        .map(|change| {
+            change.percent_change.map_or_else(
+                || {
+                    if change.to.value == change.from.value {
+                        "had no meaningful percentage change".to_owned()
+                    } else {
+                        "changed from a zero baseline; percentage change is not meaningful"
+                            .to_owned()
+                    }
+                },
+                |percent| format!("changed {percent:+.1}%"),
+            )
+        })
+        .unwrap_or_else(|| "had no comparable overall change".to_owned());
+
+    let peak = metric_facts
+        .peak_complete
+        .as_ref()
+        .map(|point| {
+            format!(
+                "{} was highest at {}",
+                point.label,
+                format_value(metric, point.value)
+            )
+        })
+        .unwrap_or_else(|| "No complete-bucket maximum was available".to_owned());
+
+    let lowest = metric_facts
+        .lowest_complete
+        .as_ref()
+        .map(|point| {
+            format!(
+                "{} was lowest at {}",
+                point.label,
+                format_value(metric, point.value)
+            )
+        })
+        .unwrap_or_else(|| "no complete-bucket minimum was available".to_owned());
+
+    let increase = metric_facts
+        .largest_increase
+        .as_ref()
+        .map(|change| {
+            format!(
+                "Largest increase: {} to {} ({:+.0}).",
+                change.from.label, change.to.label, change.absolute_change
+            )
+        })
+        .unwrap_or_else(|| "There was no increase across complete buckets.".to_owned());
+
+    let decline = metric_facts
+        .largest_decline
+        .as_ref()
+        .map(|change| {
+            format!(
+                "Largest decline: {} to {} ({:+.0}).",
+                change.from.label, change.to.label, change.absolute_change
+            )
+        })
+        .unwrap_or_else(|| "There was no decline across complete buckets.".to_owned());
+
+    format!(
+        "Across {} complete buckets, {} to {} {}. {}, while {}.\n\n{} {}{}",
+        facts.complete_bucket_count,
+        first.label,
+        last.label,
+        overall,
+        peak,
+        lowest,
+        increase,
+        decline,
+        note
+    )
+}
+
+fn multi_metric_integrity_note(plan: &AnalyticsPlan) -> &'static str {
+    if plan.metrics.iter().all(|metric| metric.is_order_grain()) {
+        " These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV."
+    } else {
+        ""
+    }
+}
+
+fn multi_metric_fact_summary(plan: &AnalyticsPlan, facts: &AnalyticalFacts) -> String {
+    let mut summaries = Vec::new();
+    let mut first_label = None::<String>;
+    let mut last_label = None::<String>;
+
+    for metric in &plan.metrics {
+        let Some(metric_facts) = facts
+            .metrics
+            .iter()
+            .find(|facts| facts.metric == metric.value_key())
+        else {
+            continue;
+        };
+
+        let (Some(first), Some(last)) = (
+            metric_facts.first_complete.as_ref(),
+            metric_facts.last_complete.as_ref(),
+        ) else {
+            continue;
+        };
+
+        first_label.get_or_insert_with(|| first.label.clone());
+
+        last_label.get_or_insert_with(|| last.label.clone());
+
+        let change = metric_facts
+            .overall_change
+            .as_ref()
+            .and_then(|change| change.percent_change)
+            .map_or_else(
+                || {
+                    if first.value == last.value {
+                        format!("{} had no percentage change", metric_label(*metric))
+                    } else {
+                        format!(
+                            "{} changed from a zero baseline; percentage change is not meaningful",
+                            metric_label(*metric)
+                        )
+                    }
+                },
+                |percent| format!("{} changed {percent:+.1}%", metric_label(*metric)),
+            );
+
+        summaries.push(change);
+    }
+
+    if summaries.is_empty() {
+        return format!(
+            "No complete metric series were available for analytical comparison.{}",
+            partial_bucket_note(facts)
+        );
+    }
+
+    let first_label = first_label.unwrap_or_else(|| "first complete bucket".to_owned());
+
+    let last_label = last_label.unwrap_or_else(|| "last complete bucket".to_owned());
+
+    format!(
+        "Across {} complete buckets from {} through {}, {}.{}{}",
+        facts.complete_bucket_count,
+        first_label,
+        last_label,
+        summaries.join(", while "),
+        multi_metric_integrity_note(plan),
+        partial_bucket_note(facts)
+    )
+}
+
+fn partial_bucket_note(facts: &AnalyticalFacts) -> String {
+    match (facts.partial_start_bucket, facts.partial_end_bucket) {
+        (true, true) => {
+            " The first and last buckets are partial and are excluded from analytical comparisons."
+                .to_owned()
+        }
+        (true, false) => {
+            " The first bucket is partial and is excluded from analytical comparisons.".to_owned()
+        }
+        (false, true) => {
+            " The last bucket is partial and is excluded from analytical comparisons.".to_owned()
+        }
+        (false, false) => String::new(),
+    }
 }
 
 fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric) -> String {
@@ -30,7 +511,11 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
             .unwrap_or(0.0);
         if matches!(
             metric,
-            Metric::OrderCount | Metric::UniqueCustomers | Metric::CancelledOrderCount
+            Metric::OrderCount
+                | Metric::UniqueCustomers
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::CancelledOrderCount
         ) {
             return format!(
                 "There were {} {} for {}.",
@@ -57,7 +542,11 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
     if points.len() == 1 {
         if matches!(
             metric,
-            Metric::OrderCount | Metric::UniqueCustomers | Metric::CancelledOrderCount
+            Metric::OrderCount
+                | Metric::UniqueCustomers
+                | Metric::ProductOrderCount
+                | Metric::ProductUniqueCustomers
+                | Metric::CancelledOrderCount
         ) {
             return format!(
                 "There were {} {} for {}.",
@@ -141,6 +630,38 @@ fn comparison_summary(plan: &AnalyticsPlan, result: &QueryResult, metric: Metric
     )
 }
 
+fn multi_metric_scalar_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
+    let Some(row) = result.rows.first() else {
+        return "No matching analytics data was found for the requested periods.".to_owned();
+    };
+
+    let values = plan
+        .metrics
+        .iter()
+        .filter_map(|metric| {
+            let value = row.get(metric.value_key())?.as_f64()?;
+
+            Some(format!(
+                "{} {}",
+                metric_label(*metric),
+                format_value(*metric, value)
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        return "No matching analytics data was found for the requested periods.".to_owned();
+    }
+
+    let period = plan
+        .periods
+        .first()
+        .map(|period| period.label.as_str())
+        .unwrap_or("the requested period");
+
+    format!("For {period}: {}.", values.join("; "))
+}
+
 fn multi_metric_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
     let first = result.rows.first().unwrap();
     let last = result.rows.last().unwrap();
@@ -167,12 +688,35 @@ fn multi_metric_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
             ))
         })
         .collect::<Vec<_>>();
-    format!("Across {} through {}, {}. These calculations use independent order-grain aggregates, so line items do not multiply order value or AOV.", first_label, last_label, facts.join(", while "))
+    format!(
+        "Across {} through {}, {}.{}",
+        first_label,
+        last_label,
+        facts.join(", while "),
+        multi_metric_integrity_note(plan)
+    )
 }
 
-fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
-    let key = plan.metrics[0].value_key();
-    let mut rankings = Vec::<(String, Vec<(String, f64)>)>::new();
+fn ranking_item_label(plan: &AnalyticsPlan, row: &serde_json::Map<String, Value>) -> String {
+    let value = if plan.dimensions.contains(&Dimension::Product) {
+        row.get("product_name")
+            .or_else(|| row.get("historical_product_label"))
+    } else {
+        row.get("variant_title")
+            .or_else(|| row.get("historical_product_label"))
+            .or_else(|| row.get("variant_name"))
+            .or_else(|| row.get("product_name"))
+    };
+
+    value
+        .and_then(Value::as_str)
+        .unwrap_or("Unnamed item")
+        .to_owned()
+}
+
+fn multi_metric_ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
+    let mut periods = Vec::<(String, Vec<&serde_json::Map<String, Value>>)>::new();
+
     for row in &result.rows {
         let period = row
             .get("period")
@@ -180,47 +724,120 @@ fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
             .or_else(|| plan.periods.first().map(|period| period.label.as_str()))
             .unwrap_or("Requested period")
             .to_owned();
-        let item = if plan.dimensions.contains(&Dimension::Product) {
-            row.get("product_name")
-                .or_else(|| row.get("historical_product_label"))
+
+        if let Some(existing) = periods.iter_mut().find(|entry| entry.0 == period) {
+            existing.1.push(row);
         } else {
-            row.get("historical_product_label")
-                .or_else(|| row.get("variant_name"))
-                .or_else(|| row.get("product_name"))
+            periods.push((period, vec![row]));
         }
-        .and_then(Value::as_str)
-        .unwrap_or("Unnamed item")
-        .to_owned();
+    }
+
+    periods
+        .into_iter()
+        .filter_map(|(period, rows)| {
+            let leaders = plan
+                .metrics
+                .iter()
+                .filter_map(|metric| {
+                    let key = metric.value_key();
+
+                    let (row, value) = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let value = row.get(key)?.as_f64()?;
+
+                            Some((*row, value))
+                        })
+                        .max_by(|left, right| left.1.total_cmp(&right.1))?;
+
+                    Some(format!(
+                        "{} leads {} with {}",
+                        ranking_item_label(plan, row),
+                        metric_label(*metric),
+                        format_value(*metric, value)
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            if leaders.is_empty() {
+                None
+            } else {
+                Some(format!("For {period}, {}.", leaders.join("; ")))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ranking_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
+    let metric = plan.metrics[0];
+    let key = metric.value_key();
+
+    let mut rankings = Vec::<(String, Vec<(String, f64)>)>::new();
+
+    for row in &result.rows {
+        let period = row
+            .get("period")
+            .and_then(Value::as_str)
+            .or_else(|| plan.periods.first().map(|period| period.label.as_str()))
+            .unwrap_or("Requested period")
+            .to_owned();
+
+        let item = ranking_item_label(plan, row);
+
         let value = row.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+
         if let Some(existing) = rankings.iter_mut().find(|entry| entry.0 == period) {
             existing.1.push((item, value));
         } else {
             rankings.push((period, vec![(item, value)]));
         }
     }
+
     rankings
         .into_iter()
         .filter_map(|(period, points)| {
             let leader = points.first()?;
-            let runner_gap = points
-                .get(1)
-                .map(|runner| leader.1 - runner.1)
-                .unwrap_or(0.0);
-            let top3 = points.iter().take(3).map(|point| point.1).sum::<f64>();
-            let top5 = points.iter().take(5).map(|point| point.1).sum::<f64>();
-            let total = points.iter().map(|point| point.1).sum::<f64>();
-            Some(format!(
-                "For {period}, {} leads with {}, a {:.0}-unit gap over the runner-up; top 3 total {:.0}, top 5 total {:.0}, and returned top-N totals {:.0}.",
+
+            let gap = points.get(1).map(|runner| leader.1 - runner.1);
+
+            let mut summary = format!(
+                "For {period}, {} leads with {}",
                 leader.0,
-                format_value(plan.metrics[0], leader.1),
-                runner_gap,
-                top3,
-                top5,
-                total
-            ))
+                format_value(metric, leader.1)
+            );
+
+            if let Some(gap) = gap {
+                summary.push_str(&format!(
+                    ", ahead of the runner-up by {}",
+                    format_value(metric, gap)
+                ));
+            }
+
+            if ranking_metric_is_additive(metric) {
+                let top3 = points.iter().take(3).map(|point| point.1).sum::<f64>();
+
+                let top5 = points.iter().take(5).map(|point| point.1).sum::<f64>();
+
+                let returned_total = points.iter().map(|point| point.1).sum::<f64>();
+
+                summary.push_str(&format!(
+                    "; top 3 total {}, top 5 total {}, and returned top-N total {}",
+                    format_value(metric, top3),
+                    format_value(metric, top5),
+                    format_value(metric, returned_total)
+                ));
+            }
+
+            summary.push('.');
+            Some(summary)
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn ranking_metric_is_additive(metric: Metric) -> bool {
+    matches!(metric, Metric::QuantitySold | Metric::ProductSalesValue)
 }
 
 fn status_summary(plan: &AnalyticsPlan, result: &QueryResult) -> String {
@@ -385,8 +1002,10 @@ fn row_label(row: &serde_json::Map<String, Value>) -> Option<String> {
         "day",
         "week",
         "month",
+        "variant_title",
         "variant_name",
         "product_name",
+        "historical_product_label",
         "operational_status",
         "order_status",
         "fulfillment_status",
@@ -409,12 +1028,17 @@ fn metric_label(metric: Metric) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "average item quantity per order",
         Metric::CancelledOrderCount => "cancelled orders",
         Metric::CancellationRate => "cancellation rate",
+        Metric::ProductOrderCount => "product orders",
+        Metric::ProductUniqueCustomers => "unique product buyers",
+        Metric::ProductSalesValue => "product sales value",
     }
 }
 
 fn format_value(metric: Metric, value: f64) -> String {
     match metric {
-        Metric::OrderValue | Metric::AverageOrderValue => format_currency(value),
+        Metric::OrderValue | Metric::AverageOrderValue | Metric::ProductSalesValue => {
+            format_currency(value)
+        }
         Metric::CancellationRate => format!("{value:.1}%"),
         _ => format!("{value:.0}"),
     }
@@ -438,6 +1062,10 @@ fn format_currency(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::facts::{
+        TemporalVariantMixShiftDriverFacts, TemporalVariantMixShiftTransitionDriverFacts,
+        VariantMixShiftDriverFact,
+    };
     use crate::analytics::plan::{
         AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod, VisualizationIntent,
     };
@@ -562,5 +1190,694 @@ mod tests {
 
         assert!(summary.contains("Sharbati Wheat Atta 5kg"));
         assert!(!summary.contains("Unnamed item"));
+    }
+
+    #[test]
+    fn weekly_summary_uses_complete_bucket_facts() {
+        use crate::analytics::facts::build_time_series_facts;
+        use crate::analytics::plan::{
+            AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod, VisualizationIntent,
+        };
+        use chrono::NaiveDate;
+        use serde_json::{Map, Value};
+
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Operations,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![Dimension::Week],
+            periods: vec![TimePeriod {
+                label: "May through July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        let rows = [
+            ("2026-04-27", 120),
+            ("2026-05-04", 258),
+            ("2026-05-11", 259),
+            ("2026-05-18", 254),
+            ("2026-05-25", 235),
+            ("2026-06-01", 237),
+            ("2026-06-08", 234),
+            ("2026-06-15", 273),
+            ("2026-06-22", 331),
+            ("2026-06-29", 338),
+            ("2026-07-06", 363),
+            ("2026-07-13", 375),
+            ("2026-07-20", 382),
+            ("2026-07-27", 291),
+        ]
+        .map(|(week, count)| {
+            let mut row = Map::new();
+            row.insert("week".to_owned(), Value::String(week.to_owned()));
+            row.insert("order_count".to_owned(), Value::from(count));
+            row
+        })
+        .to_vec();
+
+        let result = QueryResult {
+            columns: vec!["week".to_owned(), "order_count".to_owned()],
+            row_count: rows.len(),
+            rows,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let facts = build_time_series_facts(&plan, &result, true, true).unwrap();
+
+        let summary = summarize_metric_query_with_facts(&plan, &result, Some(&facts));
+
+        assert!(summary.contains("12 complete buckets"));
+        assert!(summary.contains("2026-05-04"));
+        assert!(summary.contains("2026-07-20"));
+        assert!(summary.contains("Largest increase: 2026-06-15 to 2026-06-22 (+58)"));
+        assert!(summary.contains("Largest decline: 2026-05-18 to 2026-05-25 (-19)"));
+        assert!(summary.contains("The first and last buckets are partial"));
+
+        // Critical regression:
+        // the partial ending week must not become the decline claim.
+        assert!(!summary.contains("Largest decline: 2026-07-20 to 2026-07-27"));
+    }
+    #[test]
+    fn product_multi_metric_summary_does_not_claim_order_grain_aggregation() {
+        assert_eq!(
+            multi_metric_integrity_note(&AnalyticsPlan {
+                domain: AnalyticsDomain::Products,
+                metrics: vec![
+                    Metric::QuantitySold,
+                    Metric::ProductOrderCount,
+                    Metric::ProductUniqueCustomers,
+                    Metric::ProductSalesValue,
+                ],
+                dimensions: vec![Dimension::Month],
+                periods: vec![TimePeriod {
+                    label: "May through July".to_owned(),
+                    start: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                }],
+                filters: AnalyticsFilters::default(),
+                sort: Some(SortSpec::Chronological),
+                limit: None,
+                visualization: Some(VisualizationIntent::Line),
+            }),
+            ""
+        );
+    }
+    #[test]
+    fn multi_metric_variant_ranking_reports_each_metric_independently() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Variant],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let mut regular = Map::new();
+
+        regular.insert("variant_id".to_owned(), Value::from("variant_regular"));
+
+        regular.insert(
+            "variant_title".to_owned(),
+            Value::from("Sharbati Regular - 5 kg"),
+        );
+
+        regular.insert("quantity_sold".to_owned(), Value::from(100));
+
+        regular.insert("product_order_count".to_owned(), Value::from(50));
+
+        regular.insert("product_unique_customers".to_owned(), Value::from(40));
+
+        regular.insert("product_sales_value".to_owned(), Value::from(10_000.0));
+
+        let mut fine = Map::new();
+
+        fine.insert("variant_id".to_owned(), Value::from("variant_fine"));
+
+        fine.insert(
+            "variant_title".to_owned(),
+            Value::from("Sharbati Fine - 5 kg"),
+        );
+
+        fine.insert("quantity_sold".to_owned(), Value::from(80));
+
+        fine.insert("product_order_count".to_owned(), Value::from(60));
+
+        fine.insert("product_unique_customers".to_owned(), Value::from(45));
+
+        fine.insert("product_sales_value".to_owned(), Value::from(12_000.0));
+
+        let result = QueryResult {
+            columns: vec![
+                "variant_id".to_owned(),
+                "variant_title".to_owned(),
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![regular, fine],
+            row_count: 2,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let summary = summarize_metric_query(&plan, &result);
+
+        assert!(summary.contains("Sharbati Regular - 5 kg leads quantity sold with 100"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads product orders with 60"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads unique product buyers with 45"));
+
+        assert!(summary.contains("Sharbati Fine - 5 kg leads product sales value with ₹12,000.00"));
+
+        // Product-order and buyer counts are non-additive.
+        assert!(!summary.contains("top 3 total"));
+        assert!(!summary.contains("top 5 total"));
+    }
+
+    #[test]
+    fn product_performance_scalar_reports_each_metric_value() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+            sort: None,
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let mut row = Map::new();
+
+        row.insert("quantity_sold".to_owned(), Value::from(100));
+
+        row.insert("product_order_count".to_owned(), Value::from(70));
+
+        row.insert("product_unique_customers".to_owned(), Value::from(60));
+
+        row.insert("product_sales_value".to_owned(), Value::from(12_000.0));
+
+        let result = QueryResult {
+            columns: vec![
+                "quantity_sold".to_owned(),
+                "product_order_count".to_owned(),
+                "product_unique_customers".to_owned(),
+                "product_sales_value".to_owned(),
+            ],
+            rows: vec![row],
+            row_count: 1,
+            truncated: false,
+            duration_ms: 1,
+            data_as_of: None,
+        };
+
+        let summary = summarize_metric_query(&plan, &result);
+
+        assert!(summary.contains("quantity sold 100"));
+
+        assert!(summary.contains("product orders 70"));
+
+        assert!(summary.contains("unique product buyers 60"));
+
+        assert!(summary.contains("product sales value ₹12,000.00"));
+
+        assert!(!summary.contains("percentage change"));
+    }
+    #[test]
+    fn variant_driver_summary_combines_same_leaders() {
+        use crate::analytics::facts::{VariantContributionFacts, VariantDriverFact};
+
+        let facts = VariantContributionFacts {
+            variant_count: 3,
+            quantity_share_total_pct: Some(100.0),
+            sales_value_share_total_pct: Some(100.0),
+
+            top_quantity_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 42.4,
+            }),
+
+            top_sales_value_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 45.1,
+            }),
+
+            top_order_penetration_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Fine 5 kg".to_owned(),
+                percentage: 38.7,
+            }),
+
+            top_buyer_penetration_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Fine 5 kg".to_owned(),
+                percentage: 35.2,
+            }),
+        };
+
+        let summary = summarize_variant_contribution_facts(&facts).unwrap();
+
+        assert!(summary.contains(
+        "Regular 5 kg led quantity contribution at 42.4% of units sold and sales-value contribution at 45.1%."
+    ));
+
+        assert!(summary.contains(
+        "Fine 5 kg had the highest order penetration at 38.7% and the highest buyer penetration at 35.2%."
+    ));
+    }
+    #[test]
+    fn variant_driver_summary_preserves_different_leaders() {
+        use crate::analytics::facts::{VariantContributionFacts, VariantDriverFact};
+
+        let facts = VariantContributionFacts {
+            variant_count: 3,
+            quantity_share_total_pct: Some(100.0),
+            sales_value_share_total_pct: Some(100.0),
+
+            top_quantity_variant: Some(VariantDriverFact {
+                variant_id: "variant_a".to_owned(),
+                variant_title: "Regular 5 kg".to_owned(),
+                percentage: 40.0,
+            }),
+
+            top_sales_value_variant: Some(VariantDriverFact {
+                variant_id: "variant_b".to_owned(),
+                variant_title: "Coarse 10 kg".to_owned(),
+                percentage: 47.0,
+            }),
+
+            top_order_penetration_variant: None,
+            top_buyer_penetration_variant: None,
+        };
+
+        let summary = summarize_variant_contribution_facts(&facts).unwrap();
+
+        assert!(summary.contains("Regular 5 kg led quantity contribution at 40.0% of units sold."));
+
+        assert!(summary.contains("Coarse 10 kg led sales-value contribution at 47.0%."));
+    }
+    fn mix_shift_driver(
+        variant_id: &str,
+        variant_title: &str,
+        previous_pct: f64,
+        current_pct: f64,
+        change_pp: f64,
+    ) -> VariantMixShiftDriverFact {
+        VariantMixShiftDriverFact {
+            variant_id: variant_id.to_owned(),
+            variant_title: variant_title.to_owned(),
+            previous_pct,
+            current_pct,
+            change_pp,
+        }
+    }
+
+    #[test]
+    fn temporal_variant_mix_shift_summary_uses_only_latest_transition() {
+        let facts = TemporalVariantMixShiftDriverFacts {
+            transitions: vec![
+                /*
+                 * Older transition.
+                 *
+                 * None of these values should appear in the summary because
+                 * the normal temporal-product summary intentionally reports
+                 * only the latest adjacent transition.
+                 */
+                TemporalVariantMixShiftTransitionDriverFacts {
+                    from_bucket: "2026-05-01".to_owned(),
+                    to_bucket: "2026-06-01".to_owned(),
+
+                    largest_quantity_mix_gain: Some(mix_shift_driver(
+                        "variant_old_gain",
+                        "Old Quantity Gain",
+                        5.0,
+                        15.0,
+                        10.0,
+                    )),
+
+                    largest_quantity_mix_loss: Some(mix_shift_driver(
+                        "variant_old_loss",
+                        "Old Quantity Loss",
+                        20.0,
+                        10.0,
+                        -10.0,
+                    )),
+
+                    largest_sales_mix_gain: None,
+                    largest_sales_mix_loss: None,
+
+                    largest_order_penetration_gain: None,
+                    largest_order_penetration_loss: None,
+
+                    largest_buyer_penetration_gain: None,
+                    largest_buyer_penetration_loss: None,
+                },
+                /*
+                 * Latest transition.
+                 *
+                 * These numbers mirror the shape of the real Khapli/Emmer
+                 * June -> July result, while keeping the unit test independent
+                 * from live database data.
+                 */
+                TemporalVariantMixShiftTransitionDriverFacts {
+                    from_bucket: "2026-06-01".to_owned(),
+                    to_bucket: "2026-07-01".to_owned(),
+
+                    largest_quantity_mix_gain: Some(mix_shift_driver(
+                        "variant_quantity_gain",
+                        "Fine - 1 kg",
+                        2.083333333333333,
+                        9.623430962343097,
+                        7.540097629009764,
+                    )),
+
+                    largest_quantity_mix_loss: Some(mix_shift_driver(
+                        "variant_quantity_loss",
+                        "Regular - 1 kg",
+                        70.48611111111111,
+                        65.69037656903765,
+                        -4.795734542073461,
+                    )),
+
+                    largest_sales_mix_gain: Some(mix_shift_driver(
+                        "variant_sales_gain",
+                        "Regular - 5 kg",
+                        46.768317304880284,
+                        52.17135441970141,
+                        5.4030371148211245,
+                    )),
+
+                    largest_sales_mix_loss: Some(mix_shift_driver(
+                        "variant_sales_loss",
+                        "Regular - 10 kg",
+                        15.560845721799604,
+                        8.155167845853393,
+                        -7.4056778759462105,
+                    )),
+
+                    largest_order_penetration_gain: Some(mix_shift_driver(
+                        "variant_order_gain",
+                        "Fine - 1 kg",
+                        1.8867924528301887,
+                        6.4,
+                        4.513207547169811,
+                    )),
+
+                    largest_order_penetration_loss: Some(mix_shift_driver(
+                        "variant_order_loss",
+                        "Fine - 5 kg",
+                        5.031446540880504,
+                        1.6,
+                        -3.4314465408805037,
+                    )),
+
+                    largest_buyer_penetration_gain: Some(mix_shift_driver(
+                        "variant_buyer_gain",
+                        "Fine - 1 kg",
+                        2.5,
+                        7.920792079207921,
+                        5.420792079207921,
+                    )),
+
+                    largest_buyer_penetration_loss: Some(mix_shift_driver(
+                        "variant_buyer_loss",
+                        "Fine - 5 kg",
+                        6.666666666666667,
+                        1.9801980198019802,
+                        -4.686468646864687,
+                    )),
+                },
+            ],
+        };
+
+        let summary = summarize_temporal_variant_mix_shift_driver_facts(&facts)
+            .expect("latest temporal variant transition should produce a summary");
+
+        /*
+         * The raw ISO bucket dates should be rendered as human-readable
+         * calendar-month labels.
+         */
+        assert!(
+            summary.contains("Latest variant movement, June 2026 to July 2026:"),
+            "unexpected summary: {summary}"
+        );
+
+        /*
+         * Quantity-mix drivers.
+         *
+         * Full-precision facts must be rounded only for presentation.
+         */
+        assert!(
+            summary.contains(
+                "Quantity mix: Fine - 1 kg gained the most, moving from 2.1% to 9.6% (+7.5 pp)"
+            ),
+            "unexpected summary: {summary}"
+        );
+
+        assert!(
+            summary
+                .contains("Regular - 1 kg declined the most, moving from 70.5% to 65.7% (-4.8 pp)"),
+            "unexpected summary: {summary}"
+        );
+
+        /*
+         * Sales-value-mix drivers remain independent from quantity mix.
+         */
+        assert!(
+        summary.contains(
+            "Sales-value mix: Regular - 5 kg gained the most, moving from 46.8% to 52.2% (+5.4 pp)"
+        ),
+        "unexpected summary: {summary}"
+    );
+
+        assert!(
+            summary
+                .contains("Regular - 10 kg declined the most, moving from 15.6% to 8.2% (-7.4 pp)"),
+            "unexpected summary: {summary}"
+        );
+
+        /*
+         * Order-penetration movement.
+         */
+        assert!(
+        summary.contains(
+            "Order penetration: Fine - 1 kg gained the most, moving from 1.9% to 6.4% (+4.5 pp)"
+        ),
+        "unexpected summary: {summary}"
+    );
+
+        assert!(
+            summary.contains("Fine - 5 kg declined the most, moving from 5.0% to 1.6% (-3.4 pp)"),
+            "unexpected summary: {summary}"
+        );
+
+        /*
+         * Buyer-penetration movement.
+         */
+        assert!(
+        summary.contains(
+            "Buyer penetration: Fine - 1 kg gained the most, moving from 2.5% to 7.9% (+5.4 pp)"
+        ),
+        "unexpected summary: {summary}"
+    );
+
+        assert!(
+            summary.contains("Fine - 5 kg declined the most, moving from 6.7% to 2.0% (-4.7 pp)"),
+            "unexpected summary: {summary}"
+        );
+
+        /*
+         * Critical regression:
+         * only the latest adjacent transition should be narrated.
+         */
+        assert!(
+            !summary.contains("May 2026"),
+            "older transition leaked into summary: {summary}"
+        );
+
+        assert!(
+            !summary.contains("Old Quantity Gain"),
+            "older transition leaked into summary: {summary}"
+        );
+
+        assert!(
+            !summary.contains("Old Quantity Loss"),
+            "older transition leaked into summary: {summary}"
+        );
+
+        /*
+         * Internal stable IDs must never leak into user-facing prose.
+         */
+        assert!(
+            !summary.contains("variant_"),
+            "internal variant ID leaked into summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn temporal_variant_mix_shift_summary_returns_none_without_transitions() {
+        let facts = TemporalVariantMixShiftDriverFacts {
+            transitions: Vec::new(),
+        };
+
+        assert_eq!(
+            summarize_temporal_variant_mix_shift_driver_facts(&facts,),
+            None
+        );
+    }
+
+    #[test]
+    fn temporal_variant_mix_shift_summary_handles_gain_without_loss() {
+        let facts = TemporalVariantMixShiftDriverFacts {
+            transitions: vec![TemporalVariantMixShiftTransitionDriverFacts {
+                from_bucket: "2026-06-01".to_owned(),
+                to_bucket: "2026-07-01".to_owned(),
+
+                largest_quantity_mix_gain: Some(mix_shift_driver(
+                    "variant_gain",
+                    "New Variant",
+                    0.0,
+                    8.25,
+                    8.25,
+                )),
+
+                largest_quantity_mix_loss: None,
+
+                largest_sales_mix_gain: None,
+                largest_sales_mix_loss: None,
+
+                largest_order_penetration_gain: None,
+                largest_order_penetration_loss: None,
+
+                largest_buyer_penetration_gain: None,
+                largest_buyer_penetration_loss: None,
+            }],
+        };
+
+        let summary = summarize_temporal_variant_mix_shift_driver_facts(&facts)
+            .expect("a gain-only transition should still produce a summary");
+
+        assert!(
+            summary.contains(
+                "Quantity mix: New Variant gained the most, moving from 0.0% to 8.2% (+8.2 pp)."
+            ),
+            "unexpected summary: {summary}"
+        );
+
+        assert!(
+            !summary.contains("declined the most"),
+            "summary invented a loss: {summary}"
+        );
+    }
+
+    #[test]
+    fn temporal_variant_mix_shift_summary_handles_loss_without_gain() {
+        let facts = TemporalVariantMixShiftDriverFacts {
+            transitions: vec![TemporalVariantMixShiftTransitionDriverFacts {
+                from_bucket: "2026-06-01".to_owned(),
+                to_bucket: "2026-07-01".to_owned(),
+
+                largest_quantity_mix_gain: None,
+
+                largest_quantity_mix_loss: Some(mix_shift_driver(
+                    "variant_loss",
+                    "Disappearing Variant",
+                    12.0,
+                    0.0,
+                    -12.0,
+                )),
+
+                largest_sales_mix_gain: None,
+                largest_sales_mix_loss: None,
+
+                largest_order_penetration_gain: None,
+                largest_order_penetration_loss: None,
+
+                largest_buyer_penetration_gain: None,
+                largest_buyer_penetration_loss: None,
+            }],
+        };
+
+        let summary = summarize_temporal_variant_mix_shift_driver_facts(&facts)
+            .expect("a loss-only transition should still produce a summary");
+
+        assert!(
+        summary.contains(
+            "Quantity mix: Disappearing Variant declined the most, moving from 12.0% to 0.0% (-12.0 pp)."
+        ),
+        "unexpected summary: {summary}"
+    );
+
+        assert!(
+            !summary.contains("gained the most"),
+            "summary invented a gain: {summary}"
+        );
+    }
+
+    #[test]
+    fn temporal_variant_mix_shift_summary_returns_none_when_latest_transition_has_no_drivers() {
+        let facts = TemporalVariantMixShiftDriverFacts {
+            transitions: vec![TemporalVariantMixShiftTransitionDriverFacts {
+                from_bucket: "2026-06-01".to_owned(),
+                to_bucket: "2026-07-01".to_owned(),
+
+                largest_quantity_mix_gain: None,
+                largest_quantity_mix_loss: None,
+
+                largest_sales_mix_gain: None,
+                largest_sales_mix_loss: None,
+
+                largest_order_penetration_gain: None,
+                largest_order_penetration_loss: None,
+
+                largest_buyer_penetration_gain: None,
+                largest_buyer_penetration_loss: None,
+            }],
+        };
+
+        assert_eq!(
+            summarize_temporal_variant_mix_shift_driver_facts(&facts,),
+            None
+        );
     }
 }

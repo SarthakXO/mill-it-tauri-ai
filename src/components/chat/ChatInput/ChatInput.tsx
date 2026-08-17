@@ -36,12 +36,15 @@ export function ChatInput({
   };
 
   return (
-    <div className="shrink-0 border-t border-line bg-white px-4 pb-3 pt-4 sm:px-6">
+    <div className="shrink-0 border-t border-line bg-panel px-4 pb-3 pt-4 sm:px-6">
       <form className="mx-auto w-full max-w-3xl" onSubmit={handleSubmit}>
         <div className="mb-2.5 flex items-center justify-between gap-4 px-1">
           <div>
-            <label htmlFor="thinking-mode" className="text-xs font-medium text-ink-800">
+            <label htmlFor="thinking-mode" className="flex items-center gap-2 text-xs font-medium text-ink-800">
               Thinking mode
+              <span className={`rounded-full px-1.5 py-0.5 text-[0.625rem] font-semibold ${thinkingEnabled ? "bg-brand-100 text-brand-600" : "bg-panel-elevated text-ink-500"}`}>
+                {thinkingEnabled ? "On" : "Off"}
+              </span>
             </label>
             <p id="thinking-mode-help" className="mt-0.5 text-[0.6875rem] text-ink-500">
               {thinkingEnabled
@@ -54,22 +57,23 @@ export function ChatInput({
             type="button"
             role="switch"
             aria-checked={thinkingEnabled}
+            aria-label={`Thinking mode ${thinkingEnabled ? "on" : "off"}`}
             aria-describedby="thinking-mode-help"
             onClick={() => onThinkingChange(!thinkingEnabled)}
             className={`relative h-6 w-11 shrink-0 rounded-full transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-              thinkingEnabled ? "bg-brand-700" : "bg-[#cbd3ce]"
+              thinkingEnabled ? "bg-brand-700" : "bg-line"
             }`}
           >
             <span className="sr-only">Toggle Thinking mode</span>
             <span
               aria-hidden="true"
-              className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+              className={`absolute left-0 top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
                 thinkingEnabled ? "translate-x-6" : "translate-x-1"
               }`}
             />
           </button>
         </div>
-        <div className="flex items-end gap-3 rounded-xl border border-[#cfd9d2] bg-white p-2 shadow-[0_4px_18px_rgba(22,33,29,0.07)] transition focus-within:border-brand-600 focus-within:ring-3 focus-within:ring-brand-100">
+        <div className="card-shadow flex items-end gap-3 rounded-xl border border-line bg-panel-elevated p-2 transition focus-within:border-brand-600 focus-within:ring-3 focus-within:ring-brand-100">
           <label htmlFor="chat-input" className="sr-only">
             Ask Mill-it Ops a question
           </label>
@@ -86,7 +90,7 @@ export function ChatInput({
           <button
             type="submit"
             disabled={!canSubmit}
-            className="mb-0.5 flex h-10 shrink-0 items-center gap-2 rounded-lg bg-brand-700 px-4 text-sm font-semibold text-white transition hover:bg-brand-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 disabled:cursor-not-allowed disabled:bg-[#d9dfdb] disabled:text-[#89938e]"
+            className="mb-0.5 flex h-10 shrink-0 items-center gap-2 rounded-lg bg-brand-700 px-4 text-sm font-semibold text-white transition hover:bg-brand-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 disabled:cursor-not-allowed disabled:bg-line disabled:text-ink-500"
           >
             Send
             <span aria-hidden="true" className="text-base leading-none">

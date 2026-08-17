@@ -10,7 +10,7 @@ export function EmptyChat({ onPromptSelect }: EmptyChatProps) {
     <section className="mx-auto flex w-full max-w-2xl flex-col items-center px-6 text-center">
       <div
         aria-hidden="true"
-        className="mb-5 grid size-11 place-items-center rounded-xl border border-[#d4e2da] bg-brand-50 text-brand-700 shadow-[0_2px_8px_rgba(25,92,66,0.06)]"
+        className="card-shadow mb-5 grid size-11 place-items-center rounded-xl border border-line bg-brand-50 text-brand-600"
       >
         <svg viewBox="0 0 24 24" fill="none" className="size-5" aria-hidden="true">
           <path

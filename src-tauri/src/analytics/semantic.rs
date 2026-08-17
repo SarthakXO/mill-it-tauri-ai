@@ -1,13 +1,25 @@
 use super::{
-    compiler::{compile, CompiledAnalyticsQuery},
-    insights::summarize_metric_query,
-    plan::{AnalyticsPlan, Dimension, Metric, VisualizationIntent},
+    compiler::{compile_with_product_id, compile_with_product_ids, CompiledAnalyticsQuery},
+    facts::{
+        build_temporal_variant_mix_shift_facts, build_time_series_facts,
+        derive_temporal_variant_mix_shift_driver_facts, enrich_temporal_variant_contribution_facts,
+        enrich_variant_contribution_facts,
+    },
+    insights::{
+        summarize_metric_query_with_facts, summarize_temporal_variant_mix_shift_driver_facts,
+        summarize_variant_contribution_facts,
+    },
+    plan::{AnalyticsDomain, AnalyticsPlan, Dimension, Metric, SortSpec, VisualizationIntent},
+    product_resolver::{
+        resolve_product, resolve_products, MultiProductResolution, ProductResolution,
+        ResolvedProduct,
+    },
 };
 use crate::{
     agent::{AgentError, AgentResponse, ChartType, WarningBlock},
     database::{validate_sql, Database, QueryParameter, QueryResult},
 };
-use chrono::{Datelike, Duration, Weekday};
+use chrono::{Datelike, Weekday};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -19,6 +31,133 @@ pub(crate) struct SemanticExecution {
     pub(crate) summary_duration_ms: u128,
 }
 
+fn attach_resolved_product_identity(result: &mut QueryResult, product: &ResolvedProduct) {
+    for row in &mut result.rows {
+        row.insert(
+            "product_name".to_owned(),
+            Value::String(product.product_name.clone()),
+        );
+
+        row.insert(
+            "product_id".to_owned(),
+            Value::String(product.product_id.clone()),
+        );
+    }
+
+    result
+        .columns
+        .retain(|column| column != "product_name" && column != "product_id");
+
+    result.columns.insert(0, "product_id".to_owned());
+
+    result.columns.insert(0, "product_name".to_owned());
+}
+
+fn is_core_product_performance_metric(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::QuantitySold
+            | Metric::ProductOrderCount
+            | Metric::ProductUniqueCustomers
+            | Metric::ProductSalesValue
+    )
+}
+
+fn temporal_dimension_key(plan: &AnalyticsPlan) -> Option<&'static str> {
+    if plan.dimensions.contains(&Dimension::Day) {
+        Some("day")
+    } else if plan.dimensions.contains(&Dimension::Week) {
+        Some("week")
+    } else if plan.dimensions.contains(&Dimension::Month) {
+        Some("month")
+    } else {
+        None
+    }
+}
+
+fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> {
+    if plan.domain != AnalyticsDomain::Products {
+        return None;
+    }
+
+    let product = plan.filters.product.as_deref()?;
+
+    if product.trim().is_empty() {
+        return None;
+    }
+
+    // Explicit variant requests already have their grain.
+    if plan.dimensions.contains(&Dimension::Variant) {
+        return None;
+    }
+
+    // Multi-product comparisons belong to B5.
+    if plan.dimensions.contains(&Dimension::Product) {
+        return None;
+    }
+
+    if plan.periods.len() != 1 {
+        return None;
+    }
+
+    /*
+     * B3:
+     *   dimensions=[]
+     *
+     * B4-A:
+     *   dimensions=[day]
+     *   dimensions=[week]
+     *   dimensions=[month]
+     *
+     * Anything else remains unsupported by automatic
+     * variant expansion.
+     */
+    let temporal_dimension = if plan.dimensions.is_empty() {
+        None
+    } else if plan.dimensions.len() == 1
+        && matches!(
+            plan.dimensions[0],
+            Dimension::Day | Dimension::Week | Dimension::Month
+        )
+    {
+        Some(plan.dimensions[0])
+    } else {
+        return None;
+    };
+
+    /*
+     * Require genuine multi-metric product performance.
+     */
+    if plan.metrics.len() < 2
+        || !plan
+            .metrics
+            .iter()
+            .copied()
+            .all(is_core_product_performance_metric)
+    {
+        return None;
+    }
+
+    let mut variant_plan = plan.clone();
+
+    variant_plan.dimensions = if let Some(temporal_dimension) = temporal_dimension {
+        vec![temporal_dimension, Dimension::Variant]
+    } else {
+        vec![Dimension::Variant]
+    };
+
+    variant_plan.sort = Some(if temporal_dimension.is_some() {
+        SortSpec::Chronological
+    } else {
+        SortSpec::Descending
+    });
+
+    variant_plan.limit = None;
+    variant_plan.visualization = Some(VisualizationIntent::Table);
+
+    Some(variant_plan)
+}
+
 pub(crate) async fn execute_semantic_plan(
     database: &Database,
     question: &str,
@@ -27,7 +166,223 @@ pub(crate) async fn execute_semantic_plan(
 ) -> Result<SemanticExecution, AgentError> {
     plan.validate()
         .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
-    let compiled = compile(plan).map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+    let mut resolver_db_duration_ms = 0_u128;
+
+    let mut resolved_product = None;
+
+    let mut resolved_product_ids = Vec::<String>::new();
+
+    if plan.domain == AnalyticsDomain::Products {
+        /*
+         * B5 explicit multi-product comparison.
+         *
+         * Resolve the complete comparison set in one catalogue lookup.
+         * No analytical query executes unless every mention resolves
+         * successfully to a distinct canonical product.
+         */
+        if !plan.filters.products.is_empty() {
+            let lookup = resolve_products(database, &plan.filters.products).await?;
+
+            resolver_db_duration_ms = lookup.db_duration_ms;
+
+            match lookup.resolution {
+                MultiProductResolution::Resolved(products) => {
+                    #[cfg(debug_assertions)]
+                    for resolved in &products {
+                        eprintln!(
+                        "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
+                        request_id,
+                        resolved.mention,
+                        resolved.product.product_id,
+                        resolved.product.product_name,
+                        resolved.product.score
+                    );
+                    }
+
+                    /*
+                     * Preserve mention order.
+                     *
+                     * compile_with_product_ids() accepts only canonical IDs;
+                     * user-entered product strings never reach the analytical
+                     * SQL filter.
+                     */
+                    resolved_product_ids = products
+                        .into_iter()
+                        .map(|resolved| resolved.product.product_id)
+                        .collect();
+                }
+
+                MultiProductResolution::Ambiguous {
+                    mention,
+                    candidates,
+                } => {
+                    let choices = candidates
+                        .iter()
+                        .map(|candidate| candidate.product_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
+                    request_id,
+                    mention,
+                    choices
+                );
+
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
+                }
+
+                MultiProductResolution::NotFound { mention } => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
+                    request_id,
+                    mention
+                );
+
+                    return Ok(SemanticExecution {
+                        response: AgentResponse::text(format!(
+                        "I couldn't confidently match \"{mention}\" to a current published product."
+                    )),
+                        rows: 0,
+                        db_duration_ms: resolver_db_duration_ms,
+                        calculation_duration_ms: 0,
+                        summary_duration_ms: 0,
+                    });
+                }
+
+                MultiProductResolution::DuplicateResolvedProduct {
+                    first_mention,
+                    duplicate_mention,
+                    product,
+                } => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nfirst_mention={:?}\nduplicate_mention={:?}\nresult=duplicate\nproduct_id={}\nproduct_name={:?}",
+                    request_id,
+                    first_mention,
+                    duplicate_mention,
+                    product.product_id,
+                    product.product_name
+                );
+
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "\"{first_mention}\" and \"{duplicate_mention}\" both match the published product \"{}\". Please compare distinct products.",
+                        product.product_name
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
+                }
+            }
+        } else if let Some(mention) = plan.filters.product.as_deref() {
+            /*
+             * Existing B3/B4 single-product path.
+             */
+            let lookup = resolve_product(database, mention).await?;
+
+            resolver_db_duration_ms = lookup.db_duration_ms;
+
+            match lookup.resolution {
+                ProductResolution::Resolved(product) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nproduct_id={}\nproduct_name={:?}\nscore={:.3}",
+                    request_id,
+                    mention,
+                    product.product_id,
+                    product.product_name,
+                    product.score
+                );
+
+                    resolved_product = Some(product);
+                }
+
+                ProductResolution::Ambiguous(candidates) => {
+                    let choices = candidates
+                        .iter()
+                        .map(|candidate| candidate.product_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=ambiguous\nchoices={:?}",
+                    request_id,
+                    mention,
+                    choices
+                );
+
+                    return Ok(SemanticExecution {
+                    response: AgentResponse::text(format!(
+                        "I found multiple published products matching \"{mention}\": {choices}. Please specify which one you mean."
+                    )),
+                    rows: 0,
+                    db_duration_ms: resolver_db_duration_ms,
+                    calculation_duration_ms: 0,
+                    summary_duration_ms: 0,
+                });
+                }
+
+                ProductResolution::NotFound => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                    "[analytics product resolution]\nrequest_id={}\nmention={:?}\nresult=not_found",
+                    request_id,
+                    mention
+                );
+
+                    return Ok(SemanticExecution {
+                        response: AgentResponse::text(format!(
+                        "I couldn't confidently match \"{mention}\" to a current published product."
+                    )),
+                        rows: 0,
+                        db_duration_ms: resolver_db_duration_ms,
+                        calculation_duration_ms: 0,
+                        summary_duration_ms: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    /*
+     * Compile using canonical product identity.
+     *
+     * Single product:
+     *     p.id = $N
+     *
+     * Multi-product B5:
+     *     p.id IN ($N, $N+1, ...)
+     */
+    let compiled = if !plan.filters.products.is_empty() {
+        let resolved_product_id_refs = resolved_product_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        compile_with_product_ids(plan, &resolved_product_id_refs)
+    } else {
+        compile_with_product_id(
+            plan,
+            resolved_product
+                .as_ref()
+                .map(|product| product.product_id.as_str()),
+        )
+    }
+    .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
 
     #[cfg(debug_assertions)]
     {
@@ -41,11 +396,12 @@ pub(crate) async fn execute_semantic_plan(
                 &plan
                     .periods
                     .iter()
-                    .map(|period| format!("{}..{}", period.start, period.end_exclusive))
+                    .map(|period| { format!("{}..{}", period.start, period.end_exclusive) })
                     .collect::<Vec<_>>()
             )
             .unwrap_or_else(|_| "[]".to_owned())
         );
+
         eprintln!(
             "[analytics query]\nrequest_id={}\nsql={}\nparams={}",
             request_id,
@@ -54,24 +410,267 @@ pub(crate) async fn execute_semantic_plan(
         );
     }
 
-    // Defense in depth: compiler output is logged, then parsed and approved by the
-    // same AST policy used for generated SQL before it can reach PostgreSQL.
+    // Defense in depth: deterministic compiler output still passes through
+    // the same read-only AST validator before reaching PostgreSQL.
     let validated = validate_sql(&compiled.sql)?;
+
     if validated.parameter_count() != compiled.parameters.len() {
         return Err(AgentError::InvalidPlan(
             "compiled query placeholder count did not match its parameters".to_owned(),
         ));
     }
+
     let mut result = database
         .execute_deterministic(&validated, &compiled.parameters)
         .await?;
+
+    if let Some(product) = resolved_product.as_ref() {
+        /*
+         * Product/variant grouped queries already return their own
+         * identity columns.
+         *
+         * The scalar parent product-performance query does not, so
+         * attach its canonical resolved identity here.
+         */
+        if !plan.dimensions.contains(&Dimension::Product)
+            && !plan.dimensions.contains(&Dimension::Variant)
+        {
+            attach_resolved_product_identity(&mut result, product);
+        }
+    }
+
+    let mut db_duration_ms = resolver_db_duration_ms + result.duration_ms;
+
+    /*
+     * Rust-owned automatic variant expansion.
+     *
+     * Qwen produces one product-level plan.
+     * Rust derives the variant-grain plan from that already validated plan.
+     */
+    let mut variant_execution = None;
+    let mut variant_contribution_facts = None;
+    let mut temporal_variant_driver_facts = None;
+
+    if let Some(variant_plan) = derive_variant_expansion_plan(plan) {
+        variant_plan
+            .validate()
+            .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+        let variant_compiled = compile_with_product_id(
+            &variant_plan,
+            resolved_product
+                .as_ref()
+                .map(|product| product.product_id.as_str()),
+        )
+        .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+        #[cfg(debug_assertions)]
+        {
+            eprintln!(
+                "[analytics derived variant plan]\nrequest_id={}\nmetrics={:?}\ndimensions={}\nperiods={}",
+                request_id,
+                variant_plan.metrics,
+                serde_json::to_string(&variant_plan.dimensions)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                serde_json::to_string(
+                    &variant_plan
+                        .periods
+                        .iter()
+                        .map(|period| {
+                            format!(
+                                "{}..{}",
+                                period.start,
+                                period.end_exclusive
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                )
+                .unwrap_or_else(|_| "[]".to_owned())
+            );
+
+            eprintln!(
+                "[analytics derived variant query]\nrequest_id={}\nsql={}\nparams={}",
+                request_id,
+                variant_compiled.sql,
+                safe_parameters_for_log(&variant_compiled.parameters)
+            );
+        }
+
+        let variant_validated = validate_sql(&variant_compiled.sql)?;
+
+        if variant_validated.parameter_count() != variant_compiled.parameters.len() {
+            return Err(AgentError::InvalidPlan(
+                "compiled variant query placeholder count did not match its parameters".to_owned(),
+            ));
+        }
+
+        let mut variant_result = database
+            .execute_deterministic(&variant_validated, &variant_compiled.parameters)
+            .await?;
+
+        db_duration_ms += variant_result.duration_ms;
+
+        /*
+         * Avoid redundant nesting when only one qualifying variant
+         * is represented in the requested period.
+         */
+
+        if variant_result.row_count > 1 {
+            let temporal_variant_expansion = plan.dimensions.iter().any(|dimension| {
+                matches!(
+                    dimension,
+                    Dimension::Day | Dimension::Week | Dimension::Month
+                )
+            });
+
+            if temporal_variant_expansion {
+                let temporal_facts =
+                    enrich_temporal_variant_contribution_facts(plan, &result, &mut variant_result)
+                        .ok_or_else(|| {
+                            AgentError::InvalidPlan(
+                                "temporal variant contribution could not determine its time axis"
+                                    .to_owned(),
+                            )
+                        })?;
+
+                let mix_shift_facts =
+                    build_temporal_variant_mix_shift_facts(plan, &result, &variant_result)
+                        .ok_or_else(|| {
+                            AgentError::InvalidPlan(
+                                "temporal variant mix shift could not determine its time axis"
+                                    .to_owned(),
+                            )
+                        })?;
+
+                #[cfg(debug_assertions)]
+                {
+                    let variant_fact_count = mix_shift_facts
+                        .transitions
+                        .iter()
+                        .map(|transition| transition.variants.len())
+                        .sum::<usize>();
+
+                    eprintln!(
+        "[analytics temporal variant mix shift]\nrequest_id={}\nbucket_transitions={}\nvariant_transition_facts={}",
+        request_id,
+        mix_shift_facts.transitions.len(),
+        variant_fact_count,
+    );
+                }
+
+                /*
+                 * B4-B computes deterministic transition facts.
+                 * B4-C will consume them for gain/loss summaries.
+                 */
+                let mix_shift_driver_facts =
+                    derive_temporal_variant_mix_shift_driver_facts(&mix_shift_facts);
+
+                #[cfg(debug_assertions)]
+                if let Some(latest) = mix_shift_driver_facts.transitions.last() {
+                    eprintln!(
+        "[analytics temporal variant drivers]\nrequest_id={}\nfrom_bucket={}\nto_bucket={}\nquantity_gain={:?}\nquantity_loss={:?}\nsales_gain={:?}\nsales_loss={:?}\norder_penetration_gain={:?}\norder_penetration_loss={:?}\nbuyer_penetration_gain={:?}\nbuyer_penetration_loss={:?}",
+        request_id,
+        latest.from_bucket,
+        latest.to_bucket,
+        latest.largest_quantity_mix_gain,
+        latest.largest_quantity_mix_loss,
+        latest.largest_sales_mix_gain,
+        latest.largest_sales_mix_loss,
+        latest.largest_order_penetration_gain,
+        latest.largest_order_penetration_loss,
+        latest.largest_buyer_penetration_gain,
+        latest.largest_buyer_penetration_loss,
+    );
+                }
+
+                temporal_variant_driver_facts = Some(mix_shift_driver_facts);
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[analytics temporal variant contribution]\nrequest_id={}\nbuckets={:?}",
+                    request_id, temporal_facts.buckets,
+                );
+            } else {
+                /*
+                 * Existing B3 snapshot behavior.
+                 */
+                let contribution_facts =
+                    enrich_variant_contribution_facts(&result, &mut variant_result);
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant contribution]\nrequest_id={}\nvariant_count={}\nquantity_share_total_pct={:?}\nsales_value_share_total_pct={:?}",
+            request_id,
+            contribution_facts.variant_count,
+            contribution_facts.quantity_share_total_pct,
+            contribution_facts.sales_value_share_total_pct,
+        );
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant drivers]\nrequest_id={}\nquantity={:?}\nsales_value={:?}\norder_penetration={:?}\nbuyer_penetration={:?}",
+            request_id,
+            contribution_facts.top_quantity_variant,
+            contribution_facts.top_sales_value_variant,
+            contribution_facts.top_order_penetration_variant,
+            contribution_facts.top_buyer_penetration_variant,
+        );
+
+                variant_contribution_facts = Some(contribution_facts);
+            }
+
+            variant_execution = Some((variant_plan, variant_compiled, variant_result));
+        }
+    }
+
     let calculation_started = Instant::now();
+
     apply_period_labels(&mut result, &compiled);
+
+    if let Some((_, variant_compiled, variant_result)) = variant_execution.as_mut() {
+        apply_period_labels(variant_result, variant_compiled);
+    }
+
+    let (partial_start_bucket, partial_end_bucket) = partial_bucket_edges(plan);
+
+    let analytical_facts =
+        build_time_series_facts(plan, &result, partial_start_bucket, partial_end_bucket);
+
     let calculation_duration_ms = calculation_started.elapsed().as_millis();
+
+    #[cfg(debug_assertions)]
+    if let Some(facts) = analytical_facts.as_ref() {
+        eprintln!(
+            "[analytics facts]\nrequest_id={}\npartial_start_bucket={}\npartial_end_bucket={}\ncomplete_bucket_count={}",
+            request_id,
+            facts.partial_start_bucket,
+            facts.partial_end_bucket,
+            facts.complete_bucket_count
+        );
+    }
+
     let summary_started = Instant::now();
-    let answer = summarize(plan, &result);
-    let summary_duration_ms = summary_started.elapsed().as_millis();
+
+    let mut answer = summarize_metric_query_with_facts(plan, &result, analytical_facts.as_ref());
+
+    if let Some(contribution_facts) = variant_contribution_facts.as_ref() {
+        if let Some(driver_summary) = summarize_variant_contribution_facts(contribution_facts) {
+            answer.push_str("\n\n");
+            answer.push_str(&driver_summary);
+        }
+    }
+
+    if let Some(driver_facts) = temporal_variant_driver_facts.as_ref() {
+        if let Some(driver_summary) =
+            summarize_temporal_variant_mix_shift_driver_facts(driver_facts)
+        {
+            answer.push_str("\n\n");
+            answer.push_str(&driver_summary);
+        }
+    }
+
     let chart_type = chart_type(plan);
+
     let mut response = AgentResponse::from_query(
         answer,
         question,
@@ -81,19 +680,109 @@ pub(crate) async fn execute_semantic_plan(
         chart_type,
         Some(chart_title(plan).to_owned()),
     );
-    if partial_week_edges(plan) {
-        response.warnings.push(WarningBlock {
-            message: "The first and last calendar-week buckets are partial because the selected range starts or ends mid-week.".to_owned(),
-        });
+
+    let mut expanded_rows = 0usize;
+
+    if let Some((variant_plan, variant_compiled, variant_result)) = variant_execution {
+        let variant_answer =
+            summarize_metric_query_with_facts(&variant_plan, &variant_result, None);
+
+        /*
+         * Reuse the existing response/table presentation pipeline instead
+         * of creating a second frontend-specific result shape.
+         */
+        let variant_response = AgentResponse::from_query(
+            variant_answer.clone(),
+            question,
+            semantic_intent(&variant_plan),
+            variant_compiled.expected_shape,
+            &variant_result,
+            None,
+            None,
+        );
+
+        response.rename_primary_table("product-performance", "Product performance");
+
+        if let Some(mut variant_table) = variant_response.tables.into_iter().next() {
+            variant_table.id = "variant-performance".to_owned();
+
+            variant_table.title = "Variant performance".to_owned();
+
+            response.tables.push(variant_table);
+
+            /*
+             * Temporal product performance gets an explicit
+             * multi-series variant chart.
+             *
+             * Single-period B3 snapshots remain table-only.
+             */
+            if let Some(x_key) = temporal_dimension_key(&variant_plan) {
+                let chart_added = response.add_multi_series_line_chart(
+                    "variant-performance-trend",
+                    "variant-performance",
+                    "Variant performance over time",
+                    x_key,
+                    "quantity_sold",
+                    "variant_id",
+                    "variant_title",
+                    &[
+                        "quantity_sold",
+                        "product_sales_value",
+                        "product_order_count",
+                        "product_unique_customers",
+                        "quantity_share_pct",
+                        "sales_value_share_pct",
+                        "order_penetration_pct",
+                        "buyer_penetration_pct",
+                    ],
+                    true,
+                );
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+            "[analytics variant chart]\nrequest_id={}\nadded={}\ndataset=variant-performance\nx_key={}\ny_key=quantity_sold\nseries_key=variant_id\nseries_label_key=variant_title\nzero_fill_missing_points=true",
+            request_id,
+            chart_added,
+            x_key,
+        );
+            }
+        }
+
+        response.warnings.extend(variant_response.warnings);
+
+        if !variant_answer.trim().is_empty() {
+            response.answer.push_str("\n\nVariant breakdown: ");
+
+            response.answer.push_str(variant_answer.trim());
+        }
+
+        expanded_rows = variant_result.row_count;
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[analytics variant expansion]\nrequest_id={}\nvariant_rows={}",
+            request_id, variant_result.row_count
+        );
     }
+
+    if let Some(message) = partial_bucket_warning(plan, partial_start_bucket, partial_end_bucket) {
+        response.warnings.push(WarningBlock { message });
+    }
+
+    let summary_duration_ms = summary_started.elapsed().as_millis();
+
     #[cfg(debug_assertions)]
     eprintln!(
-        "[analytics summary]\nrequest_id={}\nmode=deterministic\nmetrics={:?}\nrows={}",
-        request_id, plan.metrics, result.row_count
+        "[analytics summary]\nrequest_id={}\nmode=deterministic\nmetrics={:?}\nrows={}\nvariant_rows={}",
+        request_id,
+        plan.metrics,
+        result.row_count,
+        expanded_rows
     );
+
     Ok(SemanticExecution {
-        rows: result.row_count,
-        db_duration_ms: result.duration_ms,
+        rows: result.row_count + expanded_rows,
+        db_duration_ms,
         calculation_duration_ms,
         summary_duration_ms,
         response,
@@ -120,17 +809,63 @@ fn apply_period_labels(result: &mut QueryResult, compiled: &CompiledAnalyticsQue
     result.columns.insert(0, "period".to_owned());
 }
 
-fn summarize(plan: &AnalyticsPlan, result: &QueryResult) -> String {
-    summarize_metric_query(plan, result)
+fn partial_bucket_edges(plan: &AnalyticsPlan) -> (bool, bool) {
+    if plan.periods.len() != 1 {
+        return (false, false);
+    }
+
+    let period = &plan.periods[0];
+
+    if plan.dimensions.contains(&Dimension::Week) {
+        return (
+            period.start.weekday() != Weekday::Mon,
+            period.end_exclusive.weekday() != Weekday::Mon,
+        );
+    }
+
+    if plan.dimensions.contains(&Dimension::Month) {
+        return (period.start.day() != 1, period.end_exclusive.day() != 1);
+    }
+
+    // Day-grain historical periods already use whole-day
+    // start-inclusive/end-exclusive boundaries.
+    (false, false)
 }
 
-fn partial_week_edges(plan: &AnalyticsPlan) -> bool {
-    if !plan.dimensions.contains(&Dimension::Week) || plan.periods.len() != 1 {
-        return false;
+fn partial_bucket_warning(
+    plan: &AnalyticsPlan,
+    partial_start_bucket: bool,
+    partial_end_bucket: bool,
+) -> Option<String> {
+    if !partial_start_bucket && !partial_end_bucket {
+        return None;
     }
-    let period = &plan.periods[0];
-    period.start.weekday() != Weekday::Mon
-        || (period.end_exclusive - Duration::days(1)).weekday() != Weekday::Sun
+
+    let (bucket, boundary) = if plan.dimensions.contains(&Dimension::Week) {
+        ("calendar-week", "week")
+    } else if plan.dimensions.contains(&Dimension::Month) {
+        ("calendar-month", "month")
+    } else {
+        return None;
+    };
+
+    let message = match (
+        partial_start_bucket,
+        partial_end_bucket,
+    ) {
+        (true, true) => format!(
+            "The first and last {bucket} buckets are partial because the selected range starts or ends mid-{boundary}."
+        ),
+        (true, false) => format!(
+            "The first {bucket} bucket is partial because the selected range starts mid-{boundary}."
+        ),
+        (false, true) => format!(
+            "The last {bucket} bucket is partial because the selected range ends mid-{boundary}."
+        ),
+        (false, false) => unreachable!(),
+    };
+
+    Some(message)
 }
 
 fn chart_type(plan: &AnalyticsPlan) -> Option<ChartType> {
@@ -153,6 +888,11 @@ fn semantic_intent(plan: &AnalyticsPlan) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "semantic average item quantity per order",
         Metric::CancelledOrderCount => "semantic cancelled order count",
         Metric::CancellationRate => "semantic cancellation rate",
+        Metric::ProductOrderCount => "semantic product order count",
+
+        Metric::ProductUniqueCustomers => "semantic product unique buyer count",
+
+        Metric::ProductSalesValue => "semantic product merchandise sales value",
     }
 }
 
@@ -167,6 +907,9 @@ fn chart_title(plan: &AnalyticsPlan) -> &'static str {
         Metric::AverageItemQuantityPerOrder => "Average item quantity per order",
         Metric::CancelledOrderCount => "Cancelled orders",
         Metric::CancellationRate => "Cancellation rate",
+        Metric::ProductOrderCount => "Product orders",
+        Metric::ProductUniqueCustomers => "Product buyers",
+        Metric::ProductSalesValue => "Product sales value",
     }
 }
 
@@ -247,6 +990,135 @@ mod tests {
             limit: None,
             visualization: Some(VisualizationIntent::Line),
         };
-        assert!(partial_week_edges(&plan));
+        assert_eq!(partial_bucket_edges(&plan), (true, true));
+    }
+    #[test]
+    fn monthly_partial_edges_are_detected() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Operations,
+            metrics: vec![Metric::OrderCount],
+            dimensions: vec![Dimension::Month],
+            periods: vec![TimePeriod {
+                label: "Rolling three months".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 5, 13).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+            }],
+            filters: AnalyticsFilters::default(),
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        assert_eq!(partial_bucket_edges(&plan), (true, true));
+    }
+    #[test]
+    fn named_product_multi_metric_snapshot_derives_variant_plan() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                exclude_cancelled: true,
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: None,
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        let variant =
+            derive_variant_expansion_plan(&plan).expect("named product performance should expand");
+
+        assert_eq!(variant.metrics, plan.metrics);
+
+        assert_eq!(variant.dimensions, vec![Dimension::Variant]);
+
+        assert_eq!(variant.filters.product.as_deref(), Some("MP Sharbati Atta"));
+
+        assert_eq!(variant.sort, Some(SortSpec::Descending));
+
+        assert_eq!(variant.limit, None);
+
+        assert_eq!(variant.visualization, Some(VisualizationIntent::Table));
+
+        assert!(variant.validate().is_ok());
+    }
+    #[test]
+    fn explicit_variant_plan_is_not_auto_expanded_again() {
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![Metric::QuantitySold, Metric::ProductOrderCount],
+            dimensions: vec![Dimension::Variant],
+            periods: vec![TimePeriod {
+                label: "July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Descending),
+            limit: None,
+            visualization: Some(VisualizationIntent::Table),
+        };
+
+        assert!(derive_variant_expansion_plan(&plan).is_none());
+    }
+    #[test]
+    fn monthly_product_performance_derives_month_variant_plan() {
+        use crate::analytics::plan::{AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod};
+        use chrono::NaiveDate;
+
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+            dimensions: vec![Dimension::Month],
+            periods: vec![TimePeriod {
+                label: "January through July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+            filters: AnalyticsFilters {
+                product: Some("MP Sharbati Atta".to_owned()),
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+            sort: Some(SortSpec::Chronological),
+            limit: None,
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        let variant = derive_variant_expansion_plan(&plan)
+            .expect("monthly product performance should expand");
+
+        assert_eq!(
+            variant.dimensions,
+            vec![Dimension::Month, Dimension::Variant,]
+        );
+
+        assert_eq!(variant.sort, Some(SortSpec::Chronological));
+
+        assert_eq!(variant.limit, None);
+
+        assert_eq!(variant.visualization, Some(VisualizationIntent::Table));
+
+        assert!(variant.validate().is_ok());
     }
 }

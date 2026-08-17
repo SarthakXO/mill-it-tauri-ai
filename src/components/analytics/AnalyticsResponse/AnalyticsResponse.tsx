@@ -28,7 +28,7 @@ export function AnalyticsResponse({ response }: AnalyticsResponseProps) {
       {warnings.map((warning, index) => (
         <div
           key={`${warning.message}-${index}`}
-          className="rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900"
+          className="rounded-lg border border-warning-border bg-warning px-3.5 py-3 text-xs leading-5 text-warning-text"
           role="note"
         >
           {warning.message}
