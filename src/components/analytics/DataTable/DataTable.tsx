@@ -59,6 +59,7 @@ export function DataTable({ table }: DataTableProps) {
       <CollapsibleSection
         title={table.title}
         subtitle={`${table.rowCount.toLocaleString()} ${table.rowCount === 1 ? "row" : "rows"}`}
+        defaultExpanded={false}
         actions={
           <>
             <button type="button" onClick={() => void copy("table", tableToTsv(table))} disabled={table.columns.length === 0} className={toolbarButton} aria-label={`Copy ${table.title} as TSV`}>
@@ -74,7 +75,7 @@ export function DataTable({ table }: DataTableProps) {
         {table.rows.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-ink-500">No matching data.</div>
         ) : (
-          <div className="chat-scrollbar overflow-x-auto">
+          <div className="chat-scrollbar max-h-[min(28rem,60vh)] overflow-auto overscroll-contain">
             <table className="w-full min-w-max border-collapse text-left text-sm">
               <thead className="bg-panel-elevated text-xs font-semibold uppercase tracking-[0.04em] text-ink-500">
                 <tr>
@@ -86,7 +87,7 @@ export function DataTable({ table }: DataTableProps) {
                         key={column.key}
                         scope="col"
                         aria-sort={activeSort ?? "none"}
-                        className={`whitespace-nowrap border-b border-line bg-panel-elevated px-4 py-3 ${columnIndex === 0 ? "sticky left-0 z-20 shadow-[3px_0_5px_-4px_var(--text-secondary)]" : ""} ${isNumericColumn(column) ? "text-right" : "text-left"}`}
+                        className={`sticky top-0 z-20 whitespace-nowrap border-b border-line bg-panel-elevated px-4 py-3 ${columnIndex === 0 ? "left-0 z-30 shadow-[3px_0_5px_-4px_var(--text-secondary)]" : ""} ${isNumericColumn(column) ? "text-right" : "text-left"}`}
                       >
                         {sortable ? (
                           <button type="button" onClick={() => toggleSort(column.key)} className="inline-flex items-center gap-1.5 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600">

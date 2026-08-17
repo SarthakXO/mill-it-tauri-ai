@@ -22,15 +22,22 @@ export function MultiSeriesLineChart({ chart, dataset }: MultiSeriesLineChartPro
   const metricColumn = metricColumns.find((column) => column.key === metricKey) ?? metricColumns[0];
   const data = useMemo(() => buildMultiSeriesData(chart, dataset, metricColumn?.key ?? chart.yKey), [chart, dataset, metricColumn?.key]);
   const [visibleSeries, setVisibleSeries] = useState(() => new Set(data.series.map((series) => series.id)));
+  const previousSeriesIds = useRef(new Set(data.series.map((series) => series.id)));
   const [hoveredSeries, setHoveredSeries] = useState<string | null>(null);
   const [tooltip, setTooltip] = useState<TooltipState | null>(null);
   const { theme } = useTheme();
 
   useEffect(() => {
+    const previousIds = previousSeriesIds.current;
+    const validIds = new Set(data.series.map((series) => series.id));
     setVisibleSeries((current) => {
-      const validIds = new Set(data.series.map((series) => series.id));
-      return new Set([...current].filter((id) => validIds.has(id)));
+      const next = new Set([...current].filter((id) => validIds.has(id)));
+      for (const id of validIds) {
+        if (!previousIds.has(id)) next.add(id);
+      }
+      return next;
     });
+    previousSeriesIds.current = validIds;
   }, [data.series]);
 
   if (!metricColumn || data.series.length === 0 || data.xValues.length === 0) {
