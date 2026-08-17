@@ -9,9 +9,10 @@ use super::{
 };
 use crate::{
     analytics::{
-        evaluate_latest_forecast, execute_entity_plan, execute_forecast_plan,
-        execute_semantic_plan, execute_tool, latest_complete_business_date, plan_fast_tool,
-        AnalyticsPlan, EntityListPlan, ForecastPlan, ForecastStore,
+        evaluate_latest_forecast, execute_customer_analysis_plan, execute_entity_plan,
+        execute_forecast_plan, execute_semantic_plan, execute_tool, latest_complete_business_date,
+        plan_fast_tool, AnalyticsPlan, CustomerAnalysisPlan, EntityListPlan, ForecastPlan,
+        ForecastStore,
     },
     database::{
         validate_sql, validate_sql_with_sensitive_allowlist, Database, DatabaseError,
@@ -202,6 +203,45 @@ impl<'a> AgentOrchestrator<'a> {
                 return Ok(response);
             }
             SemanticPlannerResponse {
+                route: SemanticPlannerRoute::CustomerAnalysis,
+                customer_plan: Some(plan),
+                ..
+            } => {
+                plan.validate()
+                    .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+        "[analytics route]\nrequest_id={}\nroute=customer_analysis\nmodel={}\nthinking_mode={}\nllm_used=true\nplanning_duration_ms={}",
+        request.request_id,
+        self.llm.model_name(),
+        self.llm.thinking_enabled(),
+        planning_duration_ms,
+    );
+
+                let execution = execute_customer_analysis_plan(
+                    self.database,
+                    latest_question,
+                    &request.request_id,
+                    &plan,
+                )
+                .await?;
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+        "[analytics completed]\nrequest_id={}\nroute=customer_analysis\nrows={}\nplanning_duration_ms={}\ndb_duration_ms={}\ncalculation_duration_ms={}\nsummary_duration_ms={}\ntotal_duration_ms={}\nsummary_mode=deterministic\nllm_used=true",
+        request.request_id,
+        execution.rows,
+        planning_duration_ms,
+        execution.db_duration_ms,
+        execution.calculation_duration_ms,
+        execution.summary_duration_ms,
+        total_started.elapsed().as_millis(),
+    );
+
+                return Ok(execution.response);
+            }
+            SemanticPlannerResponse {
                 route: SemanticPlannerRoute::Forecast,
                 forecast_plan: Some(plan),
                 ..
@@ -297,7 +337,10 @@ impl<'a> AgentOrchestrator<'a> {
                 )));
             }
             SemanticPlannerResponse {
-                route: SemanticPlannerRoute::EntityList | SemanticPlannerRoute::Forecast,
+                route:
+                    SemanticPlannerRoute::EntityList
+                    | SemanticPlannerRoute::CustomerAnalysis
+                    | SemanticPlannerRoute::Forecast,
                 ..
             } => {
                 return Err(AgentError::InvalidPlan(
@@ -696,6 +739,12 @@ impl<'a> AgentOrchestrator<'a> {
                                 })
                                 .or_else(|| {
                                     route
+                                        .customer_plan
+                                        .as_ref()
+                                        .and_then(|plan| serde_json::to_value(plan).ok())
+                                })
+                                .or_else(|| {
+                                    route
                                         .forecast_plan
                                         .as_ref()
                                         .and_then(|plan| serde_json::to_value(plan).ok())
@@ -892,6 +941,7 @@ impl<'a> AgentOrchestrator<'a> {
 enum SemanticPlannerRoute {
     AnalyticsPlan,
     EntityList,
+    CustomerAnalysis,
     Forecast,
     SpecializedTool,
     GeneratedSql,
@@ -928,6 +978,8 @@ struct SemanticPlannerResponse {
     plan: Option<AnalyticsPlan>,
     #[serde(default)]
     entity_plan: Option<EntityListPlan>,
+    #[serde(default)]
+    customer_plan: Option<CustomerAnalysisPlan>,
     #[serde(default)]
     forecast_plan: Option<ForecastPlan>,
     #[serde(default)]
@@ -1157,94 +1209,164 @@ fn semantic_planner_schema() -> Value {
     });
 
     let entity_plan_schema = json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "enum": [
-                            "customer",
-                            "order"
-                        ]
-                    },
-                    "period": period_schema,
-                    "minimum_order_count": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 1000
-                            }
-                        ]
-                    },
-                    "maximum_order_count": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 1000
-                            }
-                        ]
-                    },
-                    "inactive_days": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 3650
-                            }
-                        ]
-                    },
-                   "no_orders_since": {
-        "anyOf": [
-            {"type": "null"},
-            {"type": "string"}
-        ]
-    },
-                    "purchased_product": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {"type": "string"}
-                        ]
-                    },
-                    "return_records": {
-                        "type": "boolean"
-                    },
-                    "sort": {
-                        "anyOf": [
-                            {"type": "null"},
-                            {
-                                "type": "string",
-                                "enum": [
-                                    "chronological",
-                                    "ascending",
-                                    "descending"
-                                ]
-                            }
-                        ]
-                    },
-                    "limit": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "entity": {
+                "type": "string",
+                "enum": [
+                    "customer",
+                    "order"
+                ]
+            },
+            "period": period_schema.clone(),
+            "minimum_order_count": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 500
+                        "maximum": 1000
+                    }
+                ]
+            },
+            "maximum_order_count": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000
+                    }
+                ]
+            },
+            "inactive_days": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3650
+                    }
+                ]
+            },
+            "no_orders_since": {
+                "anyOf": [
+                    {"type": "null"},
+                    {"type": "string"}
+                ]
+            },
+            "purchased_product": {
+                "anyOf": [
+                    {"type": "null"},
+                    {"type": "string"}
+                ]
+            },
+            "return_records": {
+                "type": "boolean"
+            },
+            "sort": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "string",
+                        "enum": [
+                            "chronological",
+                            "ascending",
+                            "descending"
+                        ]
+                    }
+                ]
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+            }
+        },
+        "required": [
+            "entity",
+            "period",
+            "minimum_order_count",
+            "maximum_order_count",
+            "inactive_days",
+            "no_orders_since",
+            "purchased_product",
+            "return_records",
+            "sort",
+            "limit"
+        ]
+    });
+
+    let customer_plan_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+
+        "properties": {
+            "period": period_schema.clone(),
+
+            /*
+             * Only the currently executable customer segment is
+             * exposed to Qwen.
+             */
+            "segment": {
+                "type": "string",
+                "enum": [
+                    "loyal"
+                ]
+            },
+
+            /*
+             * CustomerAnalysis is internally a tagged Rust enum.
+             *
+             * At this stage expose only:
+             *
+             * PurchaseProgression {
+             *     subject: Category,
+             *     max_purchase_number
+             * }
+             */
+            "analysis": {
+                "type": "object",
+                "additionalProperties": false,
+
+                "properties": {
+                   "type": {
+    "type": "string",
+    "enum": [
+        "purchase_progression",
+        "purchase_transition"
+    ]
+},
+
+                    "subject": {
+                        "type": "string",
+                        "enum": [
+                            "category"
+                        ]
+                    },
+
+                    "max_purchase_number": {
+                        "type": "integer",
+                        "minimum": 2,
+                        "maximum": 20
                     }
                 },
+
                 "required": [
-                    "entity",
-                    "period",
-                    "minimum_order_count",
-                    "maximum_order_count",
-                    "inactive_days",
-                    "no_orders_since",
-                    "purchased_product",
-                    "return_records",
-                    "sort",
-                    "limit"
+                    "type",
+                    "subject",
+                    "max_purchase_number"
                 ]
-            });
+            }
+        },
+
+        "required": [
+            "period",
+            "segment",
+            "analysis"
+        ]
+    });
 
     let forecast_plan_schema = json!({
         "type": "object",
@@ -1315,92 +1437,100 @@ fn semantic_planner_schema() -> Value {
     });
 
     json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "route": {
-                "type": "string",
-                "enum": [
-                    "analytics_plan",
-                    "entity_list",
-                    "forecast",
-                    "specialized_tool",
-                    "generated_sql",
-                    "conversation",
-                    "blocked"
-                ]
-            },
-            "analysis_depth": {
-                "type": "string",
-                "enum": [
-                    "none",
-                    "summary",
-                    "deep"
-                ]
-            },
-            "plan": {
-                "anyOf": [
-                    {"type": "null"},
-                    analytics_plan_schema
-                ]
-            },
-            "entity_plan": {
-                "anyOf": [
-                    {"type": "null"},
-                    entity_plan_schema
-                ]
-            },
-            "forecast_plan": {
-                "anyOf": [
-                    {"type": "null"},
-                    forecast_plan_schema
-                ]
-            },
-            "specialized_tool": {
-                "anyOf": [
-                    {"type": "null"},
-                    {
-                        "type": "string",
-                        "enum": [
-                            "lapsed_customers",
-                            "reorder_demand",
-                            "busy_day_forecast",
-                            "product_performance"
-                        ]
-                    }
-                ]
-            },
-            "intent": {
-                "anyOf": [
-                    {"type": "null"},
-                    {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 500
-                    }
-                ]
-            },
-            "blocked_reason": {
-                "anyOf": [
-                    {"type": "null"},
-                    {
-                        "type": "string",
-                        "maxLength": 500
-                    }
-                ]
-            }
-        },
-        "required": [
-            "route",
-            "analysis_depth",
-            "plan",
-            "entity_plan",
-            "forecast_plan",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "route": {
+        "type": "string",
+        "enum": [
+            "analytics_plan",
+            "entity_list",
+            "customer_analysis",
+            "forecast",
             "specialized_tool",
-            "intent",
-            "blocked_reason"
+            "generated_sql",
+            "conversation",
+            "blocked"
         ]
-    })
+    },
+                "analysis_depth": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        "summary",
+                        "deep"
+                    ]
+                },
+                "plan": {
+                    "anyOf": [
+                        {"type": "null"},
+                        analytics_plan_schema
+                    ]
+                },
+                "entity_plan": {
+                    "anyOf": [
+                        {"type": "null"},
+                        entity_plan_schema
+                    ]
+                },
+                "customer_plan": {
+                    "anyOf": [
+                        {"type": "null"},
+                        customer_plan_schema
+                    ]
+                },
+                "forecast_plan": {
+                    "anyOf": [
+                        {"type": "null"},
+                        forecast_plan_schema
+                    ]
+                },
+                "specialized_tool": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "string",
+                            "enum": [
+                                "lapsed_customers",
+                                "reorder_demand",
+                                "busy_day_forecast",
+                                "product_performance"
+                            ]
+                        }
+                    ]
+                },
+                "intent": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500
+                        }
+                    ]
+                },
+                "blocked_reason": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "string",
+                            "maxLength": 500
+                        }
+                    ]
+                }
+            },
+            "required": [
+        "route",
+        "analysis_depth",
+        "plan",
+        "entity_plan",
+        "customer_plan",
+        "forecast_plan",
+        "specialized_tool",
+        "intent",
+        "blocked_reason"
+    ]
+        })
 }
 
 fn validate_semantic_historical_boundary(
@@ -1422,6 +1552,10 @@ fn validate_semantic_historical_boundary(
             plan.period.end_exclusive > boundary
                 || plan.no_orders_since.is_some_and(|cutoff| cutoff > boundary)
         }),
+        SemanticPlannerRoute::CustomerAnalysis => route
+            .customer_plan
+            .as_ref()
+            .is_some_and(|plan| plan.period.end_exclusive > boundary),
 
         _ => false,
     };
@@ -1449,6 +1583,12 @@ fn validate_semantic_route(route: &SemanticPlannerResponse) -> Result<(), String
             .as_ref()
             .ok_or_else(|| "entity_list route requires entity_plan".to_owned())?
             .validate(),
+        SemanticPlannerRoute::CustomerAnalysis => route
+            .customer_plan
+            .as_ref()
+            .ok_or_else(|| "customer_analysis route requires customer_plan".to_owned())?
+            .validate()
+            .map_err(|error| error.to_string()),
         SemanticPlannerRoute::Forecast => route
             .forecast_plan
             .as_ref()
@@ -3576,7 +3716,8 @@ impl Error for AgentError {}
 mod tests {
     use super::*;
     use crate::analytics::{
-        AnalyticsDomain, AnalyticsFilters, Dimension, Metric, SortSpec, TimePeriod,
+        AnalyticsDomain, AnalyticsFilters, CustomerAnalysis, CustomerAnalysisPlan,
+        CustomerProgressionSubject, CustomerSegment, Dimension, Metric, SortSpec, TimePeriod,
         VisualizationIntent,
     };
     use chrono::NaiveDate;
@@ -4852,6 +4993,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Line),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -4899,6 +5041,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::None),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -4957,6 +5100,7 @@ mod tests {
             }),
             specialized_tool: None,
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             intent: None,
             blocked_reason: None,
@@ -5046,6 +5190,7 @@ mod tests {
                 sort: Some(SortSpec::Descending),
                 limit: 500,
             }),
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5101,6 +5246,7 @@ mod tests {
             analysis_depth: AnalysisDepth::None,
             plan: None,
             entity_plan: Some(original_entity_plan.clone()),
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5120,6 +5266,7 @@ mod tests {
             analysis_depth: AnalysisDepth::Summary,
             plan: None,
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5138,6 +5285,7 @@ mod tests {
             analysis_depth: AnalysisDepth::Summary,
             plan: None,
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5239,6 +5387,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Bar),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5277,6 +5426,7 @@ mod tests {
                 visualization: None,
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5310,6 +5460,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Bar),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5348,6 +5499,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Bar),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5408,6 +5560,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Line),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5454,6 +5607,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Line),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5498,6 +5652,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5542,6 +5697,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5585,6 +5741,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5639,6 +5796,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5682,6 +5840,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5724,6 +5883,7 @@ mod tests {
                 visualization: None,
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5774,6 +5934,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5834,6 +5995,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5890,6 +6052,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -5942,6 +6105,7 @@ mod tests {
                 visualization: None,
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6018,6 +6182,7 @@ mod tests {
             }),
 
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6087,6 +6252,7 @@ mod tests {
             }),
 
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6138,6 +6304,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6180,6 +6347,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Line),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6226,6 +6394,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Line),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6272,6 +6441,7 @@ mod tests {
                 visualization: Some(VisualizationIntent::Table),
             }),
             entity_plan: None,
+            customer_plan: None,
             forecast_plan: None,
             specialized_tool: None,
             intent: None,
@@ -6294,5 +6464,90 @@ mod tests {
             plan.periods[0].end_exclusive,
             NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
         );
+    }
+    #[test]
+    fn semantic_planner_schema_exposes_only_supported_customer_analysis() {
+        let schema = semantic_planner_schema();
+
+        let routes = schema["properties"]["route"]["enum"]
+            .as_array()
+            .expect("route enum");
+
+        assert!(routes
+            .iter()
+            .any(|value| { value.as_str() == Some("customer_analysis") }));
+
+        let customer_plan = &schema["properties"]["customer_plan"]["anyOf"][1];
+
+        assert_eq!(customer_plan["properties"]["segment"]["enum"][0], "loyal",);
+
+        let analysis = &customer_plan["properties"]["analysis"];
+
+        assert_eq!(
+            analysis["properties"]["type"]["enum"][0],
+            "purchase_progression",
+        );
+
+        assert_eq!(analysis["properties"]["subject"]["enum"][0], "category",);
+
+        /*
+         * Do not expose unimplemented customer operations to
+         * the planner yet.
+         */
+        let serialized = serde_json::to_string(customer_plan).expect("customer schema JSON");
+
+        assert!(!serialized.contains("product_reorder",));
+
+        assert!(!serialized.contains("frequency_distribution",));
+
+        assert!(!serialized.contains("cohort_retention",));
+    }
+    #[test]
+    fn loyal_category_progression_is_a_valid_semantic_route() {
+        let customer_plan = CustomerAnalysisPlan {
+            period: TimePeriod {
+                label: "Lifetime through July 2026".to_owned(),
+
+                start: NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            },
+
+            segment: CustomerSegment::Loyal,
+
+            analysis: CustomerAnalysis::PurchaseProgression {
+                subject: CustomerProgressionSubject::Category,
+
+                max_purchase_number: 3,
+            },
+        };
+
+        let route = SemanticPlannerResponse {
+            route: SemanticPlannerRoute::CustomerAnalysis,
+
+            analysis_depth: AnalysisDepth::Summary,
+
+            plan: None,
+
+            entity_plan: None,
+
+            customer_plan: Some(customer_plan),
+
+            forecast_plan: None,
+
+            specialized_tool: None,
+
+            intent: None,
+
+            blocked_reason: None,
+        };
+
+        assert!(validate_semantic_route(&route).is_ok());
+
+        assert!(validate_semantic_historical_boundary(
+            &route,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 1,).unwrap(),),
+        )
+        .is_ok());
     }
 }

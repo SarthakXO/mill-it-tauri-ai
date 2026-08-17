@@ -103,9 +103,21 @@ pub(crate) async fn execute_customer_analysis_plan(
     );
 
     if let Some(table) = response.tables.first_mut() {
-        table.id = "customer-purchase-progression".to_owned();
+        match &plan.analysis {
+            CustomerAnalysis::PurchaseProgression { .. } => {
+                table.id = "customer-purchase-progression".to_owned();
 
-        table.title = "Customer purchase progression".to_owned();
+                table.title = "Customer purchase progression".to_owned();
+            }
+
+            CustomerAnalysis::PurchaseTransition { .. } => {
+                table.id = "customer-category-transitions".to_owned();
+
+                table.title = "Customer category transitions".to_owned();
+            }
+
+            _ => {}
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -132,15 +144,29 @@ fn compile_customer_analysis(
 ) -> Result<CompiledCustomerAnalysis, String> {
     plan.validate().map_err(|error| error.to_string())?;
 
-    let max_purchase_number = match &plan.analysis {
+    let (sql, max_purchase_number, expected_shape) = match &plan.analysis {
         CustomerAnalysis::PurchaseProgression {
             subject: CustomerProgressionSubject::Category,
             max_purchase_number,
-        } => *max_purchase_number,
+        } => (
+            CATEGORY_PURCHASE_PROGRESSION_SQL.to_owned(),
+            *max_purchase_number,
+            "category_breakdown",
+        ),
 
-        CustomerAnalysis::PurchaseProgression { .. } => {
+        CustomerAnalysis::PurchaseTransition {
+            subject: CustomerProgressionSubject::Category,
+            max_purchase_number,
+        } => (
+            CATEGORY_PURCHASE_TRANSITION_SQL.to_owned(),
+            *max_purchase_number,
+            "category_breakdown",
+        ),
+
+        CustomerAnalysis::PurchaseProgression { .. }
+        | CustomerAnalysis::PurchaseTransition { .. } => {
             return Err(
-                "product and variant purchase progression are not implemented yet".to_owned(),
+                "product and variant customer purchase analysis are not implemented yet".to_owned(),
             );
         }
 
@@ -157,16 +183,9 @@ fn compile_customer_analysis(
         }
     };
 
-    /*
-     * First live customer-analysis capability is deliberately restricted
-     * to the locked Mill-it loyal-customer definition.
-     *
-     * The typed contract already supports CustomerSegment::All so later
-     * customer operations do not require a contract redesign.
-     */
     if plan.segment != CustomerSegment::Loyal {
         return Err(
-            "category purchase progression currently requires the loyal customer segment"
+            "customer purchase progression currently requires the loyal customer segment"
                 .to_owned(),
         );
     }
@@ -178,38 +197,16 @@ fn compile_customer_analysis(
         .ok_or_else(|| "could not resolve the loyal-customer eligibility window".to_owned())?;
 
     let parameters = vec![
-        /*
-         * $1
-         *
-         * Authoritative historical as-of boundary. All lifetime
-         * sequencing stops before this exclusive date.
-         */
         QueryParameter::String(plan.period.end_exclusive.to_string()),
-        /*
-         * $2
-         *
-         * Loyalty eligibility starts exactly four months before the
-         * analysis as-of boundary.
-         */
         QueryParameter::String(eligibility_start.to_string()),
-        /*
-         * $3
-         *
-         * >= 3 qualifying orders in that four-month window.
-         */
         QueryParameter::Integer(i64::from(LOYAL_CUSTOMER_MIN_ORDERS)),
-        /*
-         * $4
-         *
-         * Bound lifetime purchase sequencing to the requested ordinal.
-         */
         QueryParameter::Integer(i64::from(max_purchase_number)),
     ];
 
     Ok(CompiledCustomerAnalysis {
-        sql: CATEGORY_PURCHASE_PROGRESSION_SQL.to_owned(),
+        sql,
         parameters,
-        expected_shape: "category_breakdown",
+        expected_shape,
         eligibility_start,
     })
 }
@@ -489,6 +486,375 @@ ORDER BY
     cc.category ASC
 "#;
 
+const CATEGORY_PURCHASE_TRANSITION_SQL: &str = r#"
+WITH RECURSIVE
+
+eligible_customers AS (
+    SELECT
+        o.customer_id
+    FROM "order" AS o
+    WHERE
+        o.customer_id IS NOT NULL
+        AND timezone('Asia/Kolkata', o.created_at) >= (($2::text)::date)
+        AND timezone('Asia/Kolkata', o.created_at) < (($1::text)::date)
+        AND NOT (
+            lower(o.status::text) IN ('canceled', 'cancelled')
+            OR upper(COALESCE(o.zoho_order_status, ''))
+                IN ('CANCELED', 'CANCELLED')
+        )
+    GROUP BY
+        o.customer_id
+    HAVING
+        COUNT(DISTINCT o.id) >= ($3::bigint)
+),
+
+qualifying_history AS (
+    SELECT
+        o.id AS order_id,
+        o.customer_id,
+        o.created_at
+    FROM "order" AS o
+    JOIN eligible_customers AS ec
+        ON ec.customer_id = o.customer_id
+    WHERE
+        o.customer_id IS NOT NULL
+        AND timezone('Asia/Kolkata', o.created_at) < (($1::text)::date)
+        AND NOT (
+            lower(o.status::text) IN ('canceled', 'cancelled')
+            OR upper(COALESCE(o.zoho_order_status, ''))
+                IN ('CANCELED', 'CANCELLED')
+        )
+),
+
+sequenced_orders AS (
+    SELECT
+        qh.order_id,
+        qh.customer_id,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY qh.customer_id
+            ORDER BY
+                qh.created_at,
+                qh.order_id
+        ) AS purchase_number
+
+    FROM qualifying_history AS qh
+),
+
+product_category_tree AS (
+    SELECT
+        pcp.product_id,
+        pc.id AS category_id,
+        pc.parent_category_id,
+        ARRAY[pc.id] AS category_path
+
+    FROM product_category_product AS pcp
+
+    JOIN product_category AS pc
+        ON pc.id =
+            pcp.product_category_id
+
+    UNION ALL
+
+    SELECT
+        pct.product_id,
+        parent.id AS category_id,
+        parent.parent_category_id,
+        pct.category_path || parent.id
+
+    FROM product_category_tree AS pct
+
+    JOIN product_category AS parent
+        ON parent.id =
+            pct.parent_category_id
+
+    WHERE
+        NOT parent.id =
+            ANY(pct.category_path)
+),
+
+canonical_product_category AS (
+    SELECT DISTINCT ON (
+        pct.product_id
+    )
+        pct.product_id,
+
+        CASE pct.category_id
+            WHEN 'pcat_01KRBDPYHB2C5CPV03929QQQFK'
+                THEN 'Atta & Daliya'
+
+            WHEN 'pcat_01KRCEBEX5NSMTW7FJZP9QN961'
+                THEN 'Bakery'
+
+            WHEN 'pcat_01KRCCWXM5B9H4N1SGPMKAWPGV'
+                THEN 'Ghee & Oils'
+
+            WHEN 'pcat_01KRCE52VH4P3831FKKE023DQX'
+                THEN 'Pre-mixes'
+
+            WHEN 'pcat_01KRCDZ157N2T2F2AZR5ZBJT4K'
+                THEN 'Rice & Pulses'
+
+            WHEN 'pcat_01KRCEDKVETGQF0405BQXB53X7'
+                THEN 'Sweets & Snacks'
+
+            WHEN 'pcat_01KRCE2TNZWTD5G04VTD5AA749'
+                THEN 'Spices & Blends'
+        END AS category
+
+    FROM product_category_tree AS pct
+
+    WHERE
+        pct.category_id IN (
+            'pcat_01KRBDPYHB2C5CPV03929QQQFK',
+            'pcat_01KRCEBEX5NSMTW7FJZP9QN961',
+            'pcat_01KRCCWXM5B9H4N1SGPMKAWPGV',
+            'pcat_01KRCE52VH4P3831FKKE023DQX',
+            'pcat_01KRCDZ157N2T2F2AZR5ZBJT4K',
+            'pcat_01KRCEDKVETGQF0405BQXB53X7',
+            'pcat_01KRCE2TNZWTD5G04VTD5AA749'
+        )
+
+    ORDER BY
+        pct.product_id,
+
+        CASE pct.category_id
+            WHEN 'pcat_01KRBDPYHB2C5CPV03929QQQFK'
+                THEN 1
+
+            WHEN 'pcat_01KRCEBEX5NSMTW7FJZP9QN961'
+                THEN 2
+
+            WHEN 'pcat_01KRCCWXM5B9H4N1SGPMKAWPGV'
+                THEN 3
+
+            WHEN 'pcat_01KRCE52VH4P3831FKKE023DQX'
+                THEN 4
+
+            WHEN 'pcat_01KRCDZ157N2T2F2AZR5ZBJT4K'
+                THEN 5
+
+            WHEN 'pcat_01KRCEDKVETGQF0405BQXB53X7'
+                THEN 6
+
+            WHEN 'pcat_01KRCE2TNZWTD5G04VTD5AA749'
+                THEN 7
+
+            ELSE 99
+        END
+),
+
+partial_cancelled AS (
+    SELECT
+        line_item_id,
+
+        SUM(
+            cancelled_quantity
+        )::bigint
+            AS partial_cancelled_qty
+
+    FROM partial_order_cancellation_item
+
+    GROUP BY
+        line_item_id
+),
+
+order_category_incidence AS (
+    /*
+     * One customer/order/category row.
+     *
+     * Multiple products belonging to the same category
+     * do not multiply category incidence.
+     */
+    SELECT DISTINCT
+        so.customer_id,
+        so.purchase_number,
+
+        COALESCE(
+            cpc.category,
+            'Unmapped'
+        ) AS category
+
+    FROM sequenced_orders AS so
+
+    JOIN line_item AS li
+        ON li.order_id =
+            so.order_id
+
+    LEFT JOIN partial_cancelled AS pcq
+        ON pcq.line_item_id =
+            li.id
+
+    LEFT JOIN product_variant AS pv
+        ON pv.id =
+            li.variant_id
+
+    LEFT JOIN canonical_product_category AS cpc
+        ON cpc.product_id =
+            pv.product_id
+
+    WHERE
+        so.purchase_number <=
+            ($4::bigint)
+
+        AND li.variant_id IS NOT NULL
+
+        AND li.is_return = false
+
+        AND GREATEST(
+            li.quantity::bigint
+                - COALESCE(
+                    pcq.partial_cancelled_qty,
+                    0
+                ),
+            0
+        ) > 0
+),
+
+transition_population AS (
+    /*
+     * Denominator is customers who actually reached
+     * both purchase N and purchase N+1.
+     */
+    SELECT
+        previous.purchase_number
+            AS from_purchase_number,
+
+        current.purchase_number
+            AS to_purchase_number,
+
+        COUNT(
+            DISTINCT previous.customer_id
+        )::bigint
+            AS customers_reaching_transition
+
+    FROM sequenced_orders AS previous
+
+    JOIN sequenced_orders AS current
+        ON current.customer_id =
+            previous.customer_id
+
+        AND current.purchase_number =
+            previous.purchase_number + 1
+
+    WHERE
+        current.purchase_number <=
+            ($4::bigint)
+
+    GROUP BY
+        previous.purchase_number,
+        current.purchase_number
+),
+
+category_transition_incidence AS (
+    /*
+     * Multi-category baskets create multiple legitimate
+     * category pairs.
+     *
+     * Example:
+     *
+     * Purchase 1: Atta + Rice
+     * Purchase 2: Atta + Bakery
+     *
+     * Produces:
+     *
+     * Atta -> Atta
+     * Atta -> Bakery
+     * Rice -> Atta
+     * Rice -> Bakery
+     *
+     * These are incidence relationships, not mutually
+     * exclusive state transitions.
+     */
+    SELECT DISTINCT
+        previous.customer_id,
+
+        previous.purchase_number
+            AS from_purchase_number,
+
+        current.purchase_number
+            AS to_purchase_number,
+
+        previous.category
+            AS from_category,
+
+        current.category
+            AS to_category
+
+    FROM order_category_incidence AS previous
+
+    JOIN order_category_incidence AS current
+        ON current.customer_id =
+            previous.customer_id
+
+        AND current.purchase_number =
+            previous.purchase_number + 1
+
+    WHERE
+        current.purchase_number <=
+            ($4::bigint)
+),
+
+transition_counts AS (
+    SELECT
+        from_purchase_number,
+        to_purchase_number,
+        from_category,
+        to_category,
+
+        COUNT(
+            DISTINCT customer_id
+        )::bigint
+            AS customers_with_transition
+
+    FROM category_transition_incidence
+
+    GROUP BY
+        from_purchase_number,
+        to_purchase_number,
+        from_category,
+        to_category
+)
+
+SELECT
+    tc.from_purchase_number,
+    tc.to_purchase_number,
+
+    tc.from_category,
+    tc.to_category,
+
+    tp.customers_reaching_transition,
+
+    tc.customers_with_transition,
+
+    ROUND(
+        (
+            100.0
+            * tc.customers_with_transition::numeric
+            / NULLIF(
+                tp.customers_reaching_transition::numeric,
+                0
+            )
+        ),
+        2
+    ) AS transition_penetration_pct
+
+FROM transition_counts AS tc
+
+JOIN transition_population AS tp
+    ON tp.from_purchase_number =
+        tc.from_purchase_number
+
+    AND tp.to_purchase_number =
+        tc.to_purchase_number
+
+ORDER BY
+    tc.from_purchase_number ASC,
+    tc.customers_with_transition DESC,
+    tc.from_category ASC,
+    tc.to_category ASC
+"#;
+
 fn summarize_customer_analysis(plan: &CustomerAnalysisPlan, result: &QueryResult) -> String {
     match &plan.analysis {
         CustomerAnalysis::PurchaseProgression {
@@ -496,10 +862,102 @@ fn summarize_customer_analysis(plan: &CustomerAnalysisPlan, result: &QueryResult
             max_purchase_number,
         } => summarize_category_progression(result, *max_purchase_number),
 
+        CustomerAnalysis::PurchaseTransition {
+            subject: CustomerProgressionSubject::Category,
+            max_purchase_number,
+        } => summarize_category_transitions(result, *max_purchase_number),
+
         _ => {
             format!("Customer analysis returned {} rows.", result.row_count)
         }
     }
+}
+
+fn summarize_category_transitions(result: &QueryResult, max_purchase_number: u32) -> String {
+    if result.rows.is_empty() {
+        return "No qualifying loyal-customer category transitions were found.".to_owned();
+    }
+
+    let mut answer = format!(
+        "Loyal-customer category transitions across consecutive purchases through purchase {}.",
+        max_purchase_number,
+    );
+
+    let mut transition_lines = Vec::new();
+
+    for from_purchase in 1..max_purchase_number {
+        let to_purchase = from_purchase + 1;
+
+        let top_row = result
+            .rows
+            .iter()
+            .filter(|row| {
+                row.get("from_purchase_number").and_then(Value::as_u64)
+                    == Some(u64::from(from_purchase))
+            })
+            .max_by(|left, right| {
+                let left_count = left
+                    .get("customers_with_transition")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+
+                let right_count = right
+                    .get("customers_with_transition")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+
+                left_count.cmp(&right_count)
+            });
+
+        let Some(top_row) = top_row else {
+            continue;
+        };
+
+        let from_category = top_row
+            .get("from_category")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+
+        let to_category = top_row
+            .get("to_category")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+
+        let customers = top_row
+            .get("customers_with_transition")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        let penetration = top_row
+            .get("transition_penetration_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        transition_lines.push(format!(
+            "{} → {}: {} → {} ({} customers, {:.2}%)",
+            ordinal_label(from_purchase),
+            ordinal_label(to_purchase),
+            from_category,
+            to_category,
+            customers,
+            penetration,
+        ));
+    }
+
+    if !transition_lines.is_empty() {
+        answer.push_str("\n\nMost common category pair at each transition:");
+
+        for line in transition_lines {
+            answer.push('\n');
+            answer.push_str(&line);
+        }
+    }
+
+    answer.push_str(
+        "\n\nTransition percentages are category-pair incidence, not mutually exclusive customer shares. Multi-category baskets can contribute to several category pairs.",
+    );
+
+    answer
 }
 
 fn summarize_category_progression(result: &QueryResult, max_purchase_number: u32) -> String {
@@ -843,5 +1301,75 @@ mod tests {
         assert!(summary.contains("3rd purchase: Bakery (31.00%)"));
 
         assert!(summary.contains("more than 100%"));
+    }
+    fn loyal_category_transition_plan() -> CustomerAnalysisPlan {
+        CustomerAnalysisPlan {
+            period: TimePeriod {
+                label: "Lifetime through July 2026".to_owned(),
+
+                start: NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            },
+
+            segment: CustomerSegment::Loyal,
+
+            analysis: CustomerAnalysis::PurchaseTransition {
+                subject: CustomerProgressionSubject::Category,
+
+                max_purchase_number: 3,
+            },
+        }
+    }
+    #[test]
+    fn category_transition_sql_uses_consecutive_purchase_pairs() {
+        let compiled = compile_customer_analysis(&loyal_category_transition_plan())
+            .expect("category transition should compile");
+
+        let normalized = compiled
+            .sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+
+        assert!(normalized.contains("current.purchase_number = previous.purchase_number + 1"));
+
+        assert!(normalized.contains("customers_reaching_transition"));
+
+        assert!(normalized.contains("customers_with_transition"));
+
+        assert!(normalized.contains("transition_penetration_pct"));
+    }
+    #[test]
+    fn category_transition_sql_passes_read_only_ast_validation() {
+        let compiled = compile_customer_analysis(&loyal_category_transition_plan())
+            .expect("category transition should compile");
+
+        let validated = validate_sql(&compiled.sql)
+            .expect("category transition SQL should pass AST validation");
+
+        assert_eq!(validated.parameter_count(), compiled.parameters.len(),);
+    }
+    #[test]
+    fn category_transition_sql_does_not_project_customer_pii() {
+        let compiled = compile_customer_analysis(&loyal_category_transition_plan())
+            .expect("category transition should compile");
+
+        let normalized = compiled.sql.to_ascii_lowercase();
+
+        for prohibited in [
+            "first_name",
+            "last_name",
+            "email",
+            "phone",
+            "address",
+            "date_of_birth",
+        ] {
+            assert!(
+                !normalized.contains(prohibited),
+                "customer transition SQL must not contain {prohibited}",
+            );
+        }
     }
 }

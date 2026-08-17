@@ -64,6 +64,21 @@ pub(crate) enum CustomerAnalysis {
     /*
      * Example:
      *
+     * "For loyal customers, show how categories transition
+     * from purchase 1 to 2 and 2 to 3."
+     *
+     * A customer's order can contain multiple categories.
+     * Therefore this represents category-pair incidence rather
+     * than an exclusive single-category state transition.
+     */
+    PurchaseTransition {
+        subject: CustomerProgressionSubject,
+        max_purchase_number: u32,
+    },
+
+    /*
+     * Example:
+     *
      * "Which products had the highest reorder rate?"
      *
      * Reordering means another qualifying order containing the
@@ -122,13 +137,11 @@ impl CustomerAnalysisPlan {
             CustomerAnalysis::PurchaseProgression {
                 max_purchase_number,
                 ..
+            }
+            | CustomerAnalysis::PurchaseTransition {
+                max_purchase_number,
+                ..
             } => {
-                /*
-                 * N=1 is not a progression.
-                 *
-                 * Keep the bound explicit so an LLM cannot ask Rust
-                 * to materialize thousands of lifetime order positions.
-                 */
                 if !(2..=MAX_PURCHASE_ORDINAL).contains(max_purchase_number) {
                     return Err(CustomerPlanValidationError::InvalidPurchaseOrdinal);
                 }
@@ -379,5 +392,21 @@ mod tests {
             unordered.validate(),
             Err(CustomerPlanValidationError::InvalidRetentionWindows)
         );
+    }
+    #[test]
+    fn loyal_category_transition_through_third_purchase_is_valid() {
+        let plan = CustomerAnalysisPlan {
+            period: period(),
+
+            segment: CustomerSegment::Loyal,
+
+            analysis: CustomerAnalysis::PurchaseTransition {
+                subject: CustomerProgressionSubject::Category,
+
+                max_purchase_number: 3,
+            },
+        };
+
+        assert!(plan.validate().is_ok());
     }
 }
