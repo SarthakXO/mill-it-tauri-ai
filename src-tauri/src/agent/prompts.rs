@@ -9,8 +9,9 @@ A generated-SQL fallback response must look exactly like:
   "analysis_depth":"none",
   "plan":null,
   "specialized_tool":null,
-  "entity_plan":null,
-  "forecast_plan":null,
+  "entity_plan": null,
+"customer_plan": null,
+"forecast_plan": null,
   "intent":"concise analytical intent",
   "blocked_reason":null
 }
@@ -43,8 +44,9 @@ An analytics-plan response must look like this valid example:
     "visualization":"bar"
   },
   "specialized_tool":null,
-  "entity_plan":null,
-  "forecast_plan":null,
+  "entity_plan": null,
+"customer_plan": null,
+"forecast_plan": null,
   "intent":null,
   "blocked_reason":null
 }
@@ -93,14 +95,15 @@ Return semantics equivalent to:
     "visualization":"none"
   },
   "specialized_tool":null,
-  "entity_plan":null,
-  "forecast_plan":null,
+  "entity_plan": null,
+"customer_plan": null,
+"forecast_plan": null,
   "intent":null,
   "blocked_reason":null
 }
 
 Allowed route values:
-analytics_plan, entity_list, forecast, specialized_tool, generated_sql, conversation, blocked.
+analytics_plan, entity_list, customer_analysis, forecast, specialized_tool, generated_sql, conversation, blocked.
 
 Allowed domain values:
 operations, customers, products.
@@ -189,6 +192,137 @@ Routing rules:
 - Do not use filters.products for an open-ended catalogue request such as "Which products sold the most?", "Which products gained the most?", "show the biggest losers", or another request whose product population is not an explicitly named finite comparison set.
 - specialized_tool=product_performance is reserved for broader product/SKU comparison algorithms that are not an explicit selected-product comparison representable by analytics_plan, including catalogue-wide current-versus-baseline investigations such as "Which SKUs performed worse in June compared with May?"
 - Do not use specialized_tool=product_performance for a single named-product performance snapshot or for a representable explicit selected-product comparison.
+
+Customer behavioral-analysis routing:
+
+- Use route=customer_analysis only for customer behavioral analyses explicitly supported by customer_plan.
+- Use analysis.type=purchase_transition when the user asks how categories move, transition, change from one purchase to the next, or what customers buy after a prior purchase.
+
+- Use analysis.type=purchase_progression when the user asks for category mix, category penetration, or categories purchased at each purchase number independently.
+- Currently supported customer_analysis operations are:
+  1. loyal-customer purchase progression by category
+  2. loyal-customer consecutive-purchase category transition
+- Do not invent or expose any other customer_analysis operation.
+- Product reorder, frequency distribution, cohort retention, lapsed/reactivated analysis, entry-product retention, basket evolution, and other customer behavioral operations are NOT yet valid customer_analysis selections unless a later contract explicitly adds them.
+- Existing analytics_plan, entity_list, specialized_tool, or generated_sql behavior remains available where independently supported.
+
+Loyal customer definition:
+"For loyal customers, show the progression of categories purchased from their first to second to third purchase."
+→ type=purchase_progression
+
+"For loyal customers, show how categories transition from their first to second to third purchase."
+→ type=purchase_transition
+
+"What categories do loyal customers move into after their first purchase?"
+→ type=purchase_transition
+
+"How does category mix look across the first three purchases?"
+→ type=purchase_progression
+- segment=loyal means at least 3 qualifying orders in the trailing 4-calendar-month eligibility window ending at customer_plan.period.end_exclusive.
+- This business definition is owned by deterministic Rust.
+- Do not encode the loyalty threshold as another field.
+- Fully cancelled orders do not qualify.
+
+Purchase progression semantics:
+- Purchase progression uses the customer's lifetime qualifying order sequence up to customer_plan.period.end_exclusive.
+- Loyalty qualification and lifetime purchase sequencing are separate.
+- Once a customer qualifies as loyal, purchase #1, #2, #3, etc. mean that customer's lifetime qualifying purchases, not merely purchases inside the four-month loyalty window.
+- Purchase order is deterministic by qualifying order created_at and order id.
+- category progression uses subject=category.
+- max_purchase_number is the highest purchase ordinal requested by the user.
+- "first to second to third purchase" means max_purchase_number=3.
+- "first three purchases" means max_purchase_number=3.
+- "first five purchases" means max_purchase_number=5.
+- If the user asks for category purchase progression without specifying an ordinal, default max_purchase_number=3.
+- Do not use product or variant as customer purchase-progression subjects yet.
+
+Customer progression period semantics:
+- customer_plan.period is the historical as-of horizon for lifetime progression.
+- When no timeframe is supplied, use:
+  start=2000-01-01
+  end_exclusive=historical_exclusive_boundary
+- A no-timeframe customer progression plan therefore means lifetime purchase sequencing through the latest complete historical boundary.
+- An explicit historical as-of period may move end_exclusive earlier, but never beyond historical_exclusive_boundary.
+
+Canonical loyal-customer category progression example:
+
+User request:
+"For loyal customers, show the progression of categories purchased from their first to second to third purchase."
+
+For runtime:
+historical_exclusive_boundary = 2026-08-17
+
+Return semantics equivalent to:
+
+{
+  "route": "customer_analysis",
+  "analysis_depth": "summary",
+  "plan": null,
+  "entity_plan": null,
+  "customer_plan": {
+    "period": {
+      "label": "Lifetime",
+      "start": "2000-01-01",
+      "end_exclusive": "2026-08-17"
+    },
+    "segment": "loyal",
+    "analysis": {
+  "type": "purchase_progression",
+  "subject": "category",
+  "max_purchase_number": 3
+}
+  },
+  "forecast_plan": null,
+  "specialized_tool": null,
+  "intent": null,
+  "blocked_reason": null
+}
+
+
+
+Do not use analytics_plan for this request.
+Do not use entity_list for this request.
+Do not use generated_sql for this request.
+Do not use specialized_tool for this request.
+
+Canonical loyal-customer category transition example:
+
+User request:
+"For loyal customers, show how categories transition from their first to second to third purchase."
+
+For runtime:
+historical_exclusive_boundary = 2026-08-17
+
+Return semantics equivalent to:
+
+{
+  "route": "customer_analysis",
+  "analysis_depth": "summary",
+  "plan": null,
+  "entity_plan": null,
+  "customer_plan": {
+    "period": {
+      "label": "Lifetime",
+      "start": "2000-01-01",
+      "end_exclusive": "2026-08-17"
+    },
+    "segment": "loyal",
+    "analysis": {
+      "type": "purchase_transition",
+      "subject": "category",
+      "max_purchase_number": 3
+    }
+  },
+  "forecast_plan": null,
+  "specialized_tool": null,
+  "intent": null,
+  "blocked_reason": null
+}
+
+Do not use analytics_plan for this request.
+Do not use entity_list for this request.
+Do not use generated_sql for this request.
+Do not use specialized_tool for this request.
 
 Canonical named-product performance example:
 

@@ -63,6 +63,16 @@ fn is_core_product_performance_metric(metric: Metric) -> bool {
     )
 }
 
+fn product_comparison_metric_key(metric: Metric) -> Option<&'static str> {
+    match metric {
+        Metric::QuantitySold => Some("quantity_sold"),
+        Metric::ProductOrderCount => Some("product_order_count"),
+        Metric::ProductUniqueCustomers => Some("product_unique_customers"),
+        Metric::ProductSalesValue => Some("product_sales_value"),
+        _ => None,
+    }
+}
+
 fn temporal_dimension_key(plan: &AnalyticsPlan) -> Option<&'static str> {
     if plan.dimensions.contains(&Dimension::Day) {
         Some("day")
@@ -158,6 +168,145 @@ fn derive_variant_expansion_plan(plan: &AnalyticsPlan) -> Option<AnalyticsPlan> 
     Some(variant_plan)
 }
 
+fn derive_multi_product_variant_expansion_plan(
+    plan: &AnalyticsPlan,
+    product_mention: &str,
+) -> Option<(AnalyticsPlan, AnalyticsPlan)> {
+    if plan.domain != AnalyticsDomain::Products {
+        return None;
+    }
+
+    if plan.filters.products.len() < 2 {
+        return None;
+    }
+
+    if !plan.dimensions.contains(&Dimension::Product) {
+        return None;
+    }
+
+    if plan.dimensions.contains(&Dimension::Variant) {
+        return None;
+    }
+
+    let product_mention = product_mention.trim();
+
+    if product_mention.is_empty() {
+        return None;
+    }
+
+    /*
+     * Convert one member of the B5 selected-product comparison back into
+     * the established B4 single-product shape.
+     *
+     * Example:
+     *
+     *   B5:
+     *     dimensions=[month, product]
+     *     products=[Sharbati, Khapli]
+     *
+     * becomes:
+     *
+     *   parent:
+     *     dimensions=[month]
+     *     product=Sharbati
+     *
+     * and then existing B4 derivation produces:
+     *
+     *   variant:
+     *     dimensions=[month, variant]
+     *     product=Sharbati
+     */
+    let mut parent_plan = plan.clone();
+
+    parent_plan.filters.products.clear();
+    parent_plan.filters.product = Some(product_mention.to_owned());
+
+    parent_plan
+        .dimensions
+        .retain(|dimension| *dimension != Dimension::Product);
+
+    parent_plan.limit = None;
+
+    let variant_plan = derive_variant_expansion_plan(&parent_plan)?;
+
+    Some((parent_plan, variant_plan))
+}
+
+fn product_result_slice(result: &QueryResult, product_id: &str) -> QueryResult {
+    let rows = result
+        .rows
+        .iter()
+        .filter(|row| row.get("product_id").and_then(Value::as_str) == Some(product_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    QueryResult {
+        columns: result.columns.clone(),
+        row_count: rows.len(),
+        rows,
+        truncated: result.truncated,
+        duration_ms: 0,
+        data_as_of: result.data_as_of.clone(),
+    }
+}
+
+fn attach_parent_product_identity(result: &mut QueryResult, product_id: &str, product_name: &str) {
+    for row in &mut result.rows {
+        row.insert(
+            "parent_product_id".to_owned(),
+            Value::String(product_id.to_owned()),
+        );
+
+        row.insert(
+            "parent_product_name".to_owned(),
+            Value::String(product_name.to_owned()),
+        );
+    }
+
+    result
+        .columns
+        .retain(|column| column != "parent_product_id" && column != "parent_product_name");
+
+    /*
+     * Keep the temporal dimension first when present.
+     */
+    let insertion_index = match result.columns.first().map(String::as_str) {
+        Some("day" | "week" | "month" | "period") => 1,
+        _ => 0,
+    };
+
+    result
+        .columns
+        .insert(insertion_index, "parent_product_name".to_owned());
+
+    result
+        .columns
+        .insert(insertion_index + 1, "parent_product_id".to_owned());
+}
+
+fn append_query_result(
+    target: &mut QueryResult,
+    mut source: QueryResult,
+) -> Result<(), AgentError> {
+    if target.columns != source.columns {
+        return Err(AgentError::InvalidPlan(
+            "multi-product variant expansion produced incompatible result columns".to_owned(),
+        ));
+    }
+
+    target.truncated |= source.truncated;
+    target.duration_ms += source.duration_ms;
+
+    if target.data_as_of.is_none() {
+        target.data_as_of = source.data_as_of.take();
+    }
+
+    target.rows.append(&mut source.rows);
+    target.row_count = target.rows.len();
+
+    Ok(())
+}
+
 pub(crate) async fn execute_semantic_plan(
     database: &Database,
     question: &str,
@@ -169,8 +318,16 @@ pub(crate) async fn execute_semantic_plan(
     let mut resolver_db_duration_ms = 0_u128;
 
     let mut resolved_product = None;
-
     let mut resolved_product_ids = Vec::<String>::new();
+
+    /*
+     * B5 keeps enough canonical identity to run and later group each
+     * product's derived variant analysis.
+     *
+     * tuple:
+     *   (original mention, canonical product id, canonical product name)
+     */
+    let mut resolved_multi_products = Vec::<(String, String, String)>::new();
 
     if plan.domain == AnalyticsDomain::Products {
         /*
@@ -206,10 +363,15 @@ pub(crate) async fn execute_semantic_plan(
                      * user-entered product strings never reach the analytical
                      * SQL filter.
                      */
-                    resolved_product_ids = products
-                        .into_iter()
-                        .map(|resolved| resolved.product.product_id)
-                        .collect();
+                    for resolved in products {
+                        let mention = resolved.mention;
+                        let product_id = resolved.product.product_id;
+                        let product_name = resolved.product.product_name;
+
+                        resolved_product_ids.push(product_id.clone());
+
+                        resolved_multi_products.push((mention, product_id, product_name));
+                    }
                 }
 
                 MultiProductResolution::Ambiguous {
@@ -451,6 +613,18 @@ pub(crate) async fn execute_semantic_plan(
     let mut variant_contribution_facts = None;
     let mut temporal_variant_driver_facts = None;
 
+    /*
+     * B5 variant comparison is deliberately separate from the established
+     * B3/B4 automatic variant expansion.
+     */
+    let mut multi_product_variant_execution: Option<(
+        AnalyticsPlan,
+        CompiledAnalyticsQuery,
+        QueryResult,
+    )> = None;
+
+    let mut multi_product_variant_summaries = Vec::<String>::new();
+
     if let Some(variant_plan) = derive_variant_expansion_plan(plan) {
         variant_plan
             .validate()
@@ -623,6 +797,245 @@ pub(crate) async fn execute_semantic_plan(
         }
     }
 
+    /*
+     * B5 selected-product variant expansion.
+     *
+     * Every selected parent product is analyzed independently using the
+     * already-proven B4 variant machinery. The enriched rows are merged
+     * only after their within-parent percentages have been calculated.
+     */
+    if !plan.filters.products.is_empty() && plan.dimensions.contains(&Dimension::Product) {
+        for (mention, product_id, product_name) in &resolved_multi_products {
+            let Some((parent_plan, variant_plan)) =
+                derive_multi_product_variant_expansion_plan(plan, mention)
+            else {
+                continue;
+            };
+
+            parent_plan
+                .validate()
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+            variant_plan
+                .validate()
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+            /*
+             * Pull only this product's rows from the already-executed B5
+             * parent query.
+             */
+            let parent_result = product_result_slice(&result, product_id);
+
+            /*
+             * No qualifying parent activity means there cannot be a useful
+             * qualifying variant decomposition for this product.
+             */
+            if parent_result.row_count == 0 {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                "[analytics multi-product variant expansion]\nrequest_id={}\nproduct_id={}\nproduct_name={:?}\nresult=no_parent_rows",
+                request_id,
+                product_id,
+                product_name,
+            );
+
+                continue;
+            }
+
+            let variant_compiled =
+                compile_with_product_id(&variant_plan, Some(product_id.as_str()))
+                    .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
+
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                "[analytics multi-product derived variant plan]\nrequest_id={}\nproduct_id={}\nproduct_name={:?}\nmetrics={:?}\ndimensions={}\nperiods={}",
+                request_id,
+                product_id,
+                product_name,
+                variant_plan.metrics,
+                serde_json::to_string(&variant_plan.dimensions)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                serde_json::to_string(
+                    &variant_plan
+                        .periods
+                        .iter()
+                        .map(|period| {
+                            format!(
+                                "{}..{}",
+                                period.start,
+                                period.end_exclusive,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                )
+                .unwrap_or_else(|_| "[]".to_owned()),
+            );
+
+                eprintln!(
+                "[analytics multi-product derived variant query]\nrequest_id={}\nproduct_id={}\nsql={}\nparams={}",
+                request_id,
+                product_id,
+                variant_compiled.sql,
+                safe_parameters_for_log(&variant_compiled.parameters),
+            );
+            }
+
+            let variant_validated = validate_sql(&variant_compiled.sql)?;
+
+            if variant_validated.parameter_count() != variant_compiled.parameters.len() {
+                return Err(AgentError::InvalidPlan(
+                "compiled multi-product variant query placeholder count did not match its parameters"
+                    .to_owned(),
+            ));
+            }
+
+            let mut variant_result = database
+                .execute_deterministic(&variant_validated, &variant_compiled.parameters)
+                .await?;
+
+            db_duration_ms += variant_result.duration_ms;
+
+            /*
+             * Apply compiled period labels before results from different
+             * products are merged.
+             */
+            apply_period_labels(&mut variant_result, &variant_compiled);
+
+            if variant_result.row_count == 0 {
+                continue;
+            }
+
+            let temporal_variant_expansion = temporal_dimension_key(&parent_plan).is_some();
+
+            if temporal_variant_expansion {
+                let temporal_facts =
+                enrich_temporal_variant_contribution_facts(
+                    &parent_plan,
+                    &parent_result,
+                    &mut variant_result,
+                )
+                .ok_or_else(|| {
+                    AgentError::InvalidPlan(
+                        "multi-product temporal variant contribution could not determine its time axis"
+                            .to_owned(),
+                    )
+                })?;
+
+                let mix_shift_facts = build_temporal_variant_mix_shift_facts(
+                    &parent_plan,
+                    &parent_result,
+                    &variant_result,
+                )
+                .ok_or_else(|| {
+                    AgentError::InvalidPlan(
+                        "multi-product temporal variant mix shift could not determine its time axis"
+                            .to_owned(),
+                    )
+                })?;
+
+                let driver_facts = derive_temporal_variant_mix_shift_driver_facts(&mix_shift_facts);
+
+                if let Some(driver_summary) =
+                    summarize_temporal_variant_mix_shift_driver_facts(&driver_facts)
+                {
+                    multi_product_variant_summaries
+                        .push(format!("{product_name}: {driver_summary}"));
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    let variant_fact_count = mix_shift_facts
+                        .transitions
+                        .iter()
+                        .map(|transition| transition.variants.len())
+                        .sum::<usize>();
+
+                    eprintln!(
+                    "[analytics multi-product temporal variant mix shift]\nrequest_id={}\nproduct_id={}\nproduct_name={:?}\nbucket_transitions={}\nvariant_transition_facts={}\nbuckets={:?}",
+                    request_id,
+                    product_id,
+                    product_name,
+                    mix_shift_facts.transitions.len(),
+                    variant_fact_count,
+                    temporal_facts.buckets,
+                );
+
+                    if let Some(latest) = driver_facts.transitions.last() {
+                        eprintln!(
+                        "[analytics multi-product temporal variant drivers]\nrequest_id={}\nproduct_id={}\nproduct_name={:?}\nfrom_bucket={}\nto_bucket={}\nquantity_gain={:?}\nquantity_loss={:?}\nsales_gain={:?}\nsales_loss={:?}\norder_penetration_gain={:?}\norder_penetration_loss={:?}\nbuyer_penetration_gain={:?}\nbuyer_penetration_loss={:?}",
+                        request_id,
+                        product_id,
+                        product_name,
+                        latest.from_bucket,
+                        latest.to_bucket,
+                        latest.largest_quantity_mix_gain,
+                        latest.largest_quantity_mix_loss,
+                        latest.largest_sales_mix_gain,
+                        latest.largest_sales_mix_loss,
+                        latest.largest_order_penetration_gain,
+                        latest.largest_order_penetration_loss,
+                        latest.largest_buyer_penetration_gain,
+                        latest.largest_buyer_penetration_loss,
+                    );
+                    }
+                }
+            } else {
+                /*
+                 * Single-period B5 comparison.
+                 *
+                 * Use the existing B3 contribution calculation independently
+                 * for this parent product.
+                 */
+                let contribution_facts =
+                    enrich_variant_contribution_facts(&parent_result, &mut variant_result);
+
+                if let Some(driver_summary) =
+                    summarize_variant_contribution_facts(&contribution_facts)
+                {
+                    multi_product_variant_summaries
+                        .push(format!("{product_name}: {driver_summary}"));
+                }
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+                "[analytics multi-product variant contribution]\nrequest_id={}\nproduct_id={}\nproduct_name={:?}\nvariant_count={}\nquantity_share_total_pct={:?}\nsales_value_share_total_pct={:?}",
+                request_id,
+                product_id,
+                product_name,
+                contribution_facts.variant_count,
+                contribution_facts.quantity_share_total_pct,
+                contribution_facts.sales_value_share_total_pct,
+            );
+            }
+
+            /*
+             * Parent identity is metadata on variant grain.
+             *
+             * It is NOT a third analytical grouping dimension.
+             */
+            attach_parent_product_identity(&mut variant_result, product_id, product_name);
+
+            if let Some((_, _, combined_variant_result)) = multi_product_variant_execution.as_mut()
+            {
+                append_query_result(combined_variant_result, variant_result)?;
+            } else {
+                multi_product_variant_execution =
+                    Some((variant_plan, variant_compiled, variant_result));
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        if let Some((_, _, variant_result)) = multi_product_variant_execution.as_ref() {
+            eprintln!(
+            "[analytics multi-product variant expansion]\nrequest_id={}\nproduct_count={}\nvariant_rows={}",
+            request_id,
+            resolved_multi_products.len(),
+            variant_result.row_count,
+        );
+        }
+    }
+
     let calculation_started = Instant::now();
 
     apply_period_labels(&mut result, &compiled);
@@ -669,6 +1082,15 @@ pub(crate) async fn execute_semantic_plan(
         }
     }
 
+    if !multi_product_variant_summaries.is_empty() {
+        answer.push_str("\n\nVariant drivers by product:");
+
+        for summary in &multi_product_variant_summaries {
+            answer.push_str("\n\n");
+            answer.push_str(summary);
+        }
+    }
+
     let chart_type = chart_type(plan);
 
     let mut response = AgentResponse::from_query(
@@ -680,6 +1102,74 @@ pub(crate) async fn execute_semantic_plan(
         chart_type,
         Some(chart_title(plan).to_owned()),
     );
+
+    /*
+     * B5 temporal selected-product comparison.
+     *
+     * The primary query is already Month/Week/Day × Product.
+     * Reuse the same interactive multi-series chart contract used by
+     * temporal variant performance:
+     *
+     *   series = product_id
+     *   label  = product_name
+     *   metric = user-switchable core product metric
+     */
+    if !plan.filters.products.is_empty() && plan.dimensions.contains(&Dimension::Product) {
+        if let Some(x_key) = temporal_dimension_key(plan) {
+            let metric_keys = plan
+                .metrics
+                .iter()
+                .copied()
+                .filter_map(product_comparison_metric_key)
+                .collect::<Vec<_>>();
+
+            if let Some(default_y_key) = metric_keys.first().copied() {
+                /*
+                 * Give this result a stable dataset identity before creating
+                 * the multi-series chart.
+                 *
+                 * rename_primary_table() also retargets any chart already
+                 * created by AgentResponse::from_query().
+                 */
+                response.rename_primary_table("product-comparison", "Product comparison");
+
+                /*
+                 * from_query() may already have created a generic line chart.
+                 * Replace it with the richer multi-series version, but restore
+                 * the generic chart if the richer chart cannot be constructed.
+                 */
+                let fallback_charts = std::mem::take(&mut response.charts);
+
+                let chart_added = response.add_multi_series_line_chart(
+                    "product-comparison-trend",
+                    "product-comparison",
+                    "Product performance over time",
+                    x_key,
+                    default_y_key,
+                    "product_id",
+                    "product_name",
+                    &metric_keys,
+                    true,
+                );
+
+                if !chart_added {
+                    response.charts = fallback_charts;
+                }
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+                "[analytics product comparison chart]\nrequest_id={}\nadded={}\ndataset=product-comparison\nx_key={}\ny_key={}\nseries_key=product_id\nseries_label_key=product_name\nmetrics={:?}\nzero_fill_missing_points=true",
+                request_id,
+                chart_added,
+                x_key,
+                default_y_key,
+                metric_keys,
+            );
+            }
+        }
+    }
+
+    let mut expanded_rows = 0usize;
 
     let mut expanded_rows = 0usize;
 
@@ -762,6 +1252,90 @@ pub(crate) async fn execute_semantic_plan(
         eprintln!(
             "[analytics variant expansion]\nrequest_id={}\nvariant_rows={}",
             request_id, variant_result.row_count
+        );
+    }
+
+    /*
+     * B5 combined variant dataset.
+     *
+     * The dataset contains variants from every selected parent product,
+     * with parent_product_id/name available to the frontend for the later
+     * product → variant selector UX.
+     */
+    if let Some((variant_plan, variant_compiled, variant_result)) = multi_product_variant_execution
+    {
+        let variant_response = AgentResponse::from_query(
+            String::new(),
+            question,
+            "selected product variant comparison",
+            variant_compiled.expected_shape,
+            &variant_result,
+            None,
+            None,
+        );
+
+        if let Some(mut variant_table) = variant_response.tables.into_iter().next() {
+            variant_table.id = "variant-comparison".to_owned();
+
+            variant_table.title = "Variant comparison".to_owned();
+
+            response.tables.push(variant_table);
+
+            /*
+             * Temporal B5 gets one switchable multi-series variant chart.
+             *
+             * The frontend will later use parent_product_id/name to limit
+             * visible variants rather than rendering every available line.
+             */
+            if let Some(x_key) = temporal_dimension_key(&variant_plan) {
+                let default_y_key = plan
+                    .metrics
+                    .iter()
+                    .copied()
+                    .filter_map(product_comparison_metric_key)
+                    .next()
+                    .unwrap_or("quantity_sold");
+
+                let chart_added = response.add_multi_series_line_chart(
+                    "variant-comparison-trend",
+                    "variant-comparison",
+                    "Variant performance across selected products",
+                    x_key,
+                    default_y_key,
+                    "variant_id",
+                    "variant_title",
+                    &[
+                        "quantity_sold",
+                        "product_sales_value",
+                        "product_order_count",
+                        "product_unique_customers",
+                        "quantity_share_pct",
+                        "sales_value_share_pct",
+                        "order_penetration_pct",
+                        "buyer_penetration_pct",
+                    ],
+                    true,
+                );
+
+                #[cfg(debug_assertions)]
+                eprintln!(
+                "[analytics multi-product variant chart]\nrequest_id={}\nadded={}\ndataset=variant-comparison\nx_key={}\ny_key={}\nseries_key=variant_id\nseries_label_key=variant_title\nzero_fill_missing_points=true",
+                request_id,
+                chart_added,
+                x_key,
+                default_y_key,
+            );
+            }
+        }
+
+        response.warnings.extend(variant_response.warnings);
+
+        expanded_rows += variant_result.row_count;
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[analytics multi-product variant response]\nrequest_id={}\nvariant_rows={}",
+            request_id, variant_result.row_count,
         );
     }
 
@@ -1119,6 +1693,67 @@ mod tests {
 
         assert_eq!(variant.visualization, Some(VisualizationIntent::Table));
 
+        assert!(variant.validate().is_ok());
+    }
+
+    #[test]
+    fn monthly_multi_product_comparison_derives_single_parent_variant_plan() {
+        use crate::analytics::plan::{AnalyticsDomain, AnalyticsFilters, SortSpec, TimePeriod};
+        use chrono::NaiveDate;
+
+        let plan = AnalyticsPlan {
+            domain: AnalyticsDomain::Products,
+
+            metrics: vec![
+                Metric::QuantitySold,
+                Metric::ProductOrderCount,
+                Metric::ProductUniqueCustomers,
+                Metric::ProductSalesValue,
+            ],
+
+            dimensions: vec![Dimension::Month, Dimension::Product],
+
+            periods: vec![TimePeriod {
+                label: "January through July 2026".to_owned(),
+                start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                end_exclusive: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            }],
+
+            filters: AnalyticsFilters {
+                products: vec!["Sharbati Atta".to_owned(), "Khapli Emmer".to_owned()],
+                exclude_cancelled: true,
+                ..AnalyticsFilters::default()
+            },
+
+            sort: Some(SortSpec::Chronological),
+
+            limit: None,
+
+            visualization: Some(VisualizationIntent::Line),
+        };
+
+        let (parent, variant) = derive_multi_product_variant_expansion_plan(&plan, "Sharbati Atta")
+            .expect("selected B5 product should derive B4 variant analysis");
+
+        assert_eq!(parent.filters.product.as_deref(), Some("Sharbati Atta"),);
+
+        assert!(parent.filters.products.is_empty());
+
+        assert_eq!(parent.dimensions, vec![Dimension::Month],);
+
+        assert_eq!(variant.filters.product.as_deref(), Some("Sharbati Atta"),);
+
+        assert!(variant.filters.products.is_empty());
+
+        assert_eq!(
+            variant.dimensions,
+            vec![Dimension::Month, Dimension::Variant,],
+        );
+
+        assert_eq!(variant.metrics, plan.metrics);
+        assert_eq!(variant.limit, None);
+
+        assert!(parent.validate().is_ok());
         assert!(variant.validate().is_ok());
     }
 }

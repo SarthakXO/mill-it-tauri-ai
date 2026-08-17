@@ -1,6 +1,7 @@
 import type { AgentResponse } from "../../../types/chat";
 import { ChartRenderer } from "../ChartRenderer/ChartRenderer";
 import { DataTable } from "../DataTable/DataTable";
+import { ProductPerformanceChart } from "../ProductPerformanceChart/ProductPerformanceChart";
 
 interface AnalyticsResponseProps {
   response: AgentResponse;
@@ -10,6 +11,18 @@ export function AnalyticsResponse({ response }: AnalyticsResponseProps) {
   const tables = response.tables ?? [];
   const charts = response.charts ?? [];
   const warnings = response.warnings ?? [];
+  const productChart = charts.find((chart) =>
+    chart.datasetId === "product-performance" || chart.datasetId === "product-comparison"
+  );
+  const variantDatasetId = productChart?.datasetId === "product-comparison"
+    ? "variant-comparison"
+    : "variant-performance";
+  const variantChart = productChart
+    ? charts.find((chart) => chart.datasetId === variantDatasetId)
+    : undefined;
+  const groupedPerformanceChartIds = new Set(
+    productChart && variantChart ? [productChart.id, variantChart.id] : [],
+  );
 
   return (
     <div className="space-y-5">
@@ -17,11 +30,15 @@ export function AnalyticsResponse({ response }: AnalyticsResponseProps) {
         {response.answer}
       </div>
 
-      {tables.map((table) => (
-        <DataTable key={table.id} table={table} />
-      ))}
+      {productChart && variantChart && (
+        <ProductPerformanceChart
+          productChart={productChart}
+          variantChart={variantChart}
+          datasets={tables}
+        />
+      )}
 
-      {charts.map((chart) => (
+      {charts.filter((chart) => !groupedPerformanceChartIds.has(chart.id)).map((chart) => (
         <ChartRenderer key={chart.id} chart={chart} datasets={tables} />
       ))}
 
@@ -33,6 +50,10 @@ export function AnalyticsResponse({ response }: AnalyticsResponseProps) {
         >
           {warning.message}
         </div>
+      ))}
+
+      {tables.map((table) => (
+        <DataTable key={table.id} table={table} />
       ))}
 
       {response.dataAsOf && (
